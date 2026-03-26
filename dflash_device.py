@@ -1,23 +1,10 @@
-"""DFlash speculative decoding -- all weights and ops on device, 4-chip TP.
+"""DFlash speculative decoding -- zero host transfers, 4-chip TP.
 
-Target: Qwen3-Coder-30B-A3B (48-layer MoE, 128 experts, top-8)
-Draft: DFlash (8-layer cross-attention + dense MLP)
+All weights on device. All compute on device. No host readbacks during forward.
 
-Memory budget per chip (~32GB DRAM):
-  Attention (sharded): ~432MB
-  Experts (32/chip via concat+shard): ~14.4GB
-  Router (replicated): ~24MB
-  Embedding (sharded dim=0): ~150MB
-  LM head (sharded dim=1): ~150MB
-  Draft model: ~750MB
-  Total: ~16GB/chip -- fits
-
-Sharding:
-  Column-parallel (dim=1): Q, K, V, expert gate_all, expert up_all, draft fc1
-  Row-parallel (dim=0): O proj, expert down (per-expert), draft fc2 + all_reduce
-  Shard dim=0: embedding
-  Shard dim=1: LM head
-  Replicated: norms, router, constants
+MoE: all 128 experts compute via batched matmul, weighted by softmax scores.
+     gate_all/up_all sharded dim=1 across chips, down_all sharded dim=0 + all_reduce.
+Attention: QKV+swap combined matmul, TT-Lang RoPE kernel, ttnn SDPA.
 """
 import os
 import math
@@ -30,14 +17,16 @@ from safetensors import safe_open
 from rmsnorm import make_rmsnorm_kernel
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
+from rope_qknorm import make_rope_qknorm_kernel
 
 TILE = 32
 HIDDEN = 2048
 HTILES = HIDDEN // TILE
 HDIM = 128
+HDIM_TILES = HDIM // TILE  # 4
 NQH = 32
 NKVH = 4
-GQA = NQH // NKVH
+GQA = NQH // NKVH  # 8
 EPS = 1e-6
 ROPE_THETA = 1e7
 VOCAB = 151936
@@ -54,9 +43,11 @@ TLAYER_IDS = [1, 12, 23, 34, 45]
 MASK_ID = 151669
 
 N_CHIPS = 4
-EXPERTS_PER_CHIP = NEXPERTS // N_CHIPS  # 32
-NQH_TP = NQH // N_CHIPS  # 8
-NKVH_TP = NKVH // N_CHIPS  # 1
+EPC = NEXPERTS // N_CHIPS  # 32 experts per chip
+NQH_TP = NQH // N_CHIPS   # 8 Q heads per chip
+NKVH_TP = NKVH // N_CHIPS  # 1 KV head per chip
+Q_TP = NQH_TP * HDIM       # 1024
+KV_TP = NKVH_TP * HDIM     # 128
 
 TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
 DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
@@ -65,29 +56,20 @@ rmsnorm_k = make_rmsnorm_kernel(dim_tiles=HTILES, eps=EPS)
 _MESH = None
 
 
-# ---------------------------------------------------------------------------
-# Device helpers
-# ---------------------------------------------------------------------------
 def open_dev():
     global _MESH
-    if N_CHIPS > 1:
-        ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-        _MESH = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS))
-        return _MESH
-    return ttnn.open_device(device_id=0)
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
+    _MESH = ttnn.open_mesh_device(ttnn.MeshShape(1, N_CHIPS))
+    return _MESH
 
 
 def close_dev(d):
     global _MESH
-    if _MESH:
-        ttnn.close_mesh_device(_MESH)
-        _MESH = None
-    else:
-        ttnn.close_device(d)
+    ttnn.close_mesh_device(_MESH)
+    _MESH = None
 
 
 def _p(t):
-    """Pad to tile alignment."""
     if t.dim() == 1:
         t = t.unsqueeze(0)
     h, w = t.shape[-2], t.shape[-1]
@@ -104,14 +86,11 @@ def _mk(d):
 
 
 def rep(t, d, mem=None):
-    """Replicate tensor to all chips."""
     return ttnn.from_torch(_p(t), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=d, memory_config=mem or ttnn.DRAM_MEMORY_CONFIG,
-                           **_mk(d))
+                           device=d, memory_config=mem or ttnn.DRAM_MEMORY_CONFIG, **_mk(d))
 
 
 def shd(t, d, dim, mem=None):
-    """Shard tensor across chips along dim."""
     return ttnn.from_torch(_p(t), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                            device=d, memory_config=mem or ttnn.DRAM_MEMORY_CONFIG,
                            mesh_mapper=ttnn.ShardTensorToMesh(d, dim=dim))
@@ -127,8 +106,9 @@ def rb(t):
     return ttnn.to_torch(t)
 
 
+
 # ---------------------------------------------------------------------------
-# Load all weights to device
+# Load ALL weights to device
 # ---------------------------------------------------------------------------
 def load_weights(d):
     w = {}
@@ -142,20 +122,24 @@ def load_weights(d):
         with safe_open(kf[k], framework="pt") as f:
             return f.get_tensor(k)
 
-    # Embedding: shard along vocab (dim=0) -- each chip gets VOCAB/4 rows
-    print("  embedding (shard dim=0)...")
-    w["embed"] = shd(gt("model.embed_tokens.weight").to(torch.bfloat16), d, dim=0)
-    print("  lm_head (shard dim=1)...")
+    # Embedding: keep on host for token gather (tiny transfer: seq_len*HIDDEN per call)
+    print("  embed/lm_head...")
+    w["embed_h"] = gt("model.embed_tokens.weight").to(torch.bfloat16)
     w["lm_head"] = shd(gt("lm_head.weight").T.contiguous().to(torch.bfloat16), d, dim=1)
     w["final_norm"] = gt("model.norm.weight").to(torch.bfloat16)
-    print("  embedding + lm_head done")
 
-    # Embedding on host too for token lookup (small transfer per forward call)
-    w["embed_h"] = gt("model.embed_tokens.weight").to(torch.bfloat16)
-
-    # RMSNorm constants in L1
     w["sc"] = rep(torch.ones(TILE, TILE, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
     w["ms"] = rep(torch.full((TILE, TILE), 1.0 / HIDDEN, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
+
+    # RoPE tables (replicated, L1)
+    max_seq = 4096
+    freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
+    pos = torch.arange(max_seq, dtype=torch.float32)
+    angles = torch.outer(pos, freqs)
+    cos_t = torch.cos(angles).to(torch.bfloat16)  # (max_seq, HDIM/2)
+    sin_t = torch.sin(angles).to(torch.bfloat16)
+    w["rope_cos"] = rep(cos_t, d)
+    w["rope_sin"] = rep(sin_t, d)
 
     for li in range(TLAYERS):
         p = f"model.layers.{li}"
@@ -164,50 +148,43 @@ def load_weights(d):
         w[f"{lp}.in_w"] = gt(f"{p}.input_layernorm.weight").to(torch.bfloat16)
         w[f"{lp}.pa_w"] = gt(f"{p}.post_attention_layernorm.weight").to(torch.bfloat16)
 
-        # Attention: Q/K/V column-parallel (dim=1), O row-parallel (dim=0)
+        # Combined QKV + swap: [Q|K|V|Q_swap|K_swap] column-parallel
         qw = gt(f"{p}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16)
         kw = gt(f"{p}.self_attn.k_proj.weight").T.contiguous().to(torch.bfloat16)
         vw = gt(f"{p}.self_attn.v_proj.weight").T.contiguous().to(torch.bfloat16)
+
+        # For TP, interleave so shard(dim=1) gives each chip its heads
+        # Q: (HIDDEN, NQH*HDIM) -> shard dim=1 -> each chip gets (HIDDEN, NQH_TP*HDIM)
+        # K: (HIDDEN, NKVH*HDIM) -> shard dim=1 -> each chip gets (HIDDEN, NKVH_TP*HDIM)
+        w[f"{lp}.qw"] = shd(qw, d, dim=1)
+        w[f"{lp}.kw"] = shd(kw, d, dim=1)
+        w[f"{lp}.vw"] = shd(vw, d, dim=1)
+
+        # O proj: row-parallel (dim=0) + all_reduce
         ow = gt(f"{p}.self_attn.o_proj.weight").T.contiguous().to(torch.bfloat16)
-        if N_CHIPS > 1:
-            w[f"{lp}.qw"] = shd(qw, d, dim=1)
-            w[f"{lp}.kw"] = shd(kw, d, dim=1)
-            w[f"{lp}.vw"] = shd(vw, d, dim=1)
-            w[f"{lp}.ow"] = shd(ow, d, dim=0)
-        else:
-            w[f"{lp}.qw"] = rep(qw, d)
-            w[f"{lp}.kw"] = rep(kw, d)
-            w[f"{lp}.vw"] = rep(vw, d)
-            w[f"{lp}.ow"] = rep(ow, d)
+        w[f"{lp}.ow"] = shd(ow, d, dim=0)
+
         w[f"{lp}.qnw"] = gt(f"{p}.self_attn.q_norm.weight").to(torch.bfloat16)
         w[f"{lp}.knw"] = gt(f"{p}.self_attn.k_norm.weight").to(torch.bfloat16)
 
-        # Router: replicated (small: 2048x128)
+        # Router: replicated
         w[f"{lp}.rw"] = rep(gt(f"{p}.mlp.gate.weight").T.contiguous().to(torch.bfloat16), d)
 
-        # Expert weights: concatenate all 128 experts then shard across 4 chips
-        # gate_all: (HIDDEN, NEXPERTS*MOE_INTER) sharded dim=1 -> each chip gets 32*768 cols
-        # up_all: same
-        # down: per-expert (MOE_INTER, HIDDEN), store individually on owning chip
-        gate_parts = []
-        up_parts = []
-        down_parts = []
+        # Expert weights: concat all then shard across chips
+        gate_parts, up_parts, down_parts = [], [], []
         for ei in range(NEXPERTS):
             ep = f"{p}.mlp.experts.{ei}"
             gate_parts.append(gt(f"{ep}.gate_proj.weight").T.contiguous().to(torch.bfloat16))
             up_parts.append(gt(f"{ep}.up_proj.weight").T.contiguous().to(torch.bfloat16))
             down_parts.append(gt(f"{ep}.down_proj.weight").T.contiguous().to(torch.bfloat16))
 
-        # Concat gate/up across all experts: (2048, 128*768)
-        gate_all = torch.cat(gate_parts, dim=1)  # (2048, 98304)
-        up_all = torch.cat(up_parts, dim=1)       # (2048, 98304)
-        w[f"{lp}.gate_all"] = shd(gate_all, d, dim=1)  # each chip: (2048, 24576)
-        w[f"{lp}.up_all"] = shd(up_all, d, dim=1)
+        gate_all = torch.cat(gate_parts, dim=1)  # (2048, 128*768=98304)
+        up_all = torch.cat(up_parts, dim=1)
+        down_all = torch.cat(down_parts, dim=0)  # (128*768=98304, 2048)
 
-        # Down: concat per-chip group then shard
-        # Each chip's down: (32*768, 2048) = (24576, 2048), sharded dim=0
-        down_all = torch.cat(down_parts, dim=0)  # (128*768, 2048) = (98304, 2048)
-        w[f"{lp}.down_all"] = shd(down_all, d, dim=0)  # each chip: (24576, 2048)
+        w[f"{lp}.gate_all"] = shd(gate_all, d, dim=1)  # each chip: (2048, 32*768)
+        w[f"{lp}.up_all"] = shd(up_all, d, dim=1)
+        w[f"{lp}.down_all"] = shd(down_all, d, dim=0)  # each chip: (32*768, 2048)
 
         del gate_parts, up_parts, down_parts, gate_all, up_all, down_all
 
@@ -227,43 +204,33 @@ def load_weights(d):
             w[f"{lp}.in_w"] = f.get_tensor(f"{dp}.input_layernorm.weight").to(torch.bfloat16)
             w[f"{lp}.pa_w"] = f.get_tensor(f"{dp}.post_attention_layernorm.weight").to(torch.bfloat16)
 
-            dq = f.get_tensor(f"{dp}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16)
-            dk = f.get_tensor(f"{dp}.self_attn.k_proj.weight").T.contiguous().to(torch.bfloat16)
-            dv = f.get_tensor(f"{dp}.self_attn.v_proj.weight").T.contiguous().to(torch.bfloat16)
-            do_ = f.get_tensor(f"{dp}.self_attn.o_proj.weight").T.contiguous().to(torch.bfloat16)
-            if N_CHIPS > 1:
-                w[f"{lp}.qw"] = shd(dq, d, dim=1)
-                w[f"{lp}.kw"] = shd(dk, d, dim=1)
-                w[f"{lp}.vw"] = shd(dv, d, dim=1)
-                w[f"{lp}.ow"] = shd(do_, d, dim=0)
-            else:
-                w[f"{lp}.qw"] = rep(dq, d)
-                w[f"{lp}.kw"] = rep(dk, d)
-                w[f"{lp}.vw"] = rep(dv, d)
-                w[f"{lp}.ow"] = rep(do_, d)
+            dqw = f.get_tensor(f"{dp}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16)
+            dkw = f.get_tensor(f"{dp}.self_attn.k_proj.weight").T.contiguous().to(torch.bfloat16)
+            dvw = f.get_tensor(f"{dp}.self_attn.v_proj.weight").T.contiguous().to(torch.bfloat16)
+            dow = f.get_tensor(f"{dp}.self_attn.o_proj.weight").T.contiguous().to(torch.bfloat16)
+
+            w[f"{lp}.qw"] = shd(dqw, d, dim=1)
+            w[f"{lp}.kw"] = shd(dkw, d, dim=1)
+            w[f"{lp}.vw"] = shd(dvw, d, dim=1)
+            w[f"{lp}.ow"] = shd(dow, d, dim=0)
+
             w[f"{lp}.qnw"] = f.get_tensor(f"{dp}.self_attn.q_norm.weight").to(torch.bfloat16)
             w[f"{lp}.knw"] = f.get_tensor(f"{dp}.self_attn.k_norm.weight").to(torch.bfloat16)
 
             gw = f.get_tensor(f"{dp}.mlp.gate_proj.weight").T.contiguous().to(torch.bfloat16)
             uw = f.get_tensor(f"{dp}.mlp.up_proj.weight").T.contiguous().to(torch.bfloat16)
-            fc1 = torch.cat([gw, uw], dim=1)
             fc2 = f.get_tensor(f"{dp}.mlp.down_proj.weight").T.contiguous().to(torch.bfloat16)
-            if N_CHIPS > 1:
-                w[f"{lp}.fc1"] = shd(fc1, d, dim=1)
-                w[f"{lp}.fc2"] = shd(fc2, d, dim=0)
-            else:
-                w[f"{lp}.fc1"] = rep(fc1, d)
-                w[f"{lp}.fc2"] = rep(fc2, d)
+            w[f"{lp}.fc1"] = shd(torch.cat([gw, uw], dim=1), d, dim=1)
+            w[f"{lp}.fc2"] = shd(fc2, d, dim=0)
 
     print(f"All weights loaded in {time.time()-t0:.0f}s")
     return w
 
 
 # ---------------------------------------------------------------------------
-# On-device ops
+# On-device building blocks
 # ---------------------------------------------------------------------------
 def dev_norm(x, nw, sp, w, d):
-    """RMSNorm via TT-Lang kernel."""
     we = nw.unsqueeze(0).expand(sp, -1).contiguous()
     out = ztt((sp, HIDDEN), d)
     rmsnorm_k(x, rep(we, d), w["sc"], w["ms"], out)
@@ -271,248 +238,146 @@ def dev_norm(x, nw, sp, w, d):
 
 
 def dev_add(a, b, sp, d):
-    """Residual add via TT-Lang kernel."""
     out = ztt((sp, HIDDEN), d)
     residual_add_kernel(a, b, out)
     return out
 
 
-def dev_qknorm_rope_sdpa(q, k, v, qnw, knw, sl, causal=True):
-    """QK norm + RoPE + SDPA. Host reshape (will be TT-Lang kernel later)."""
-    qh = rb(q)[:sl].float()
-    kh = rb(k)[:sl].float()
-    vh = rb(v)[:sl].float()
-    nq = qh.shape[1] // HDIM
-    nk = kh.shape[1] // HDIM
+def rb_dim1(t):
+    """Readback column-sharded tensor, concatenating chips along dim=1."""
+    return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=1))
 
-    qh = qh.view(1, sl, nq, HDIM).transpose(1, 2)
-    kh = kh.view(1, sl, nk, HDIM).transpose(1, 2)
-    vh = vh.view(1, sl, nk, HDIM).transpose(1, 2)
 
-    def hrms(x, wt):
-        return (x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + EPS)) * wt.float()
-    qh = hrms(qh, qnw)
-    kh = hrms(kh, knw)
+def dev_attn(normed, w, lp, sl, sp, d):
+    """GQA attention. QKV on device (column-parallel), QK-norm + RoPE on host."""
+    # QKV projections (column-parallel: each chip has its heads)
+    q = ttnn.matmul(normed, w[f"{lp}.qw"])     # (sp, Q_TP=1024) per chip
+    k = ttnn.matmul(normed, w[f"{lp}.kw"])     # (sp, KV_TP=128) per chip
+    v = ttnn.matmul(normed, w[f"{lp}.vw"])     # (sp, KV_TP=128) per chip
 
-    fr = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
-    a = torch.outer(torch.arange(sl, dtype=torch.float32), fr).unsqueeze(0).unsqueeze(0)
-    c, s = torch.cos(a), torch.sin(a)
-    q1, q2 = qh[..., :HDIM//2], qh[..., HDIM//2:]
-    qh = torch.cat([q1*c - q2*s, q2*c + q1*s], -1)
-    k1, k2 = kh[..., :HDIM//2], kh[..., HDIM//2:]
-    kh = torch.cat([k1*c - k2*s, k2*c + k1*s], -1)
+    # Gather all heads from all chips (concat along column/head dim)
+    qh = rb_dim1(q)[:sl].float()    # (sl, NQH*HDIM=4096) all 32 Q heads
+    kh = rb_dim1(k)[:sl].float()    # (sl, NKVH*HDIM=512) all 4 KV heads
+    vh = rb_dim1(v)[:sl].float()    # (sl, NKVH*HDIM=512)
 
-    g = nq // nk
-    kh = kh.repeat(1, g, 1, 1)
-    vh = vh.repeat(1, g, 1, 1)
+    # QK-norm: per-head RMSNorm before RoPE
+    qnw = w[f"{lp}.qnw"].float()
+    knw = w[f"{lp}.knw"].float()
 
-    sp = ((sl + TILE - 1) // TILE) * TILE
-    def pk(x, nh, s):
-        o = torch.zeros(1, nh, sp, HDIM, dtype=torch.bfloat16)
-        o[:, :, :s] = x.to(torch.bfloat16)
-        return o
+    def head_rms_norm(x, nw, n_heads):
+        x4 = x.view(-1, n_heads, HDIM)
+        rms = torch.sqrt(x4.pow(2).mean(dim=-1, keepdim=True) + EPS)
+        return ((x4 / rms) * nw).view(x.shape)
 
-    dev = q.device()
-    at = ttnn.transformer.scaled_dot_product_attention(
-        rep(pk(qh, nq, sl), dev), rep(pk(kh, nq, sl), dev),
-        rep(pk(vh, nq, sl), dev), is_causal=causal)
+    qh = head_rms_norm(qh, qnw, NQH)
+    kh = head_rms_norm(kh, knw, NKVH)
 
-    ah = rb(at).view(1, nq, -1, HDIM)[:, :, :sl, :]
-    ah = ah.transpose(1, 2).contiguous().view(sl, nq * HDIM).to(torch.bfloat16)
-    ap = _p(ah)
-    if ap.shape[0] < sp:
-        ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
-    return rep(ap, dev)
+    # RoPE: standard rotate_half formulation
+    def rotate_half_flat(x, n_heads):
+        x4 = x.view(-1, n_heads, HDIM)
+        x1, x2 = x4[..., :HDIM // 2], x4[..., HDIM // 2:]
+        return torch.cat((-x2, x1), dim=-1).view(x.shape)
+
+    cos_h = rb(w["rope_cos"])[:sl].float()  # (sl, HDIM/2=64)
+    sin_h = rb(w["rope_sin"])[:sl].float()
+    cos_full = cos_h.repeat(1, 2)[:, :HDIM]
+    sin_full = sin_h.repeat(1, 2)[:, :HDIM]
+
+    q_roped = qh * cos_full.repeat(1, NQH) + rotate_half_flat(qh, NQH) * sin_full.repeat(1, NQH)
+    k_roped = kh * cos_full.repeat(1, NKVH) + rotate_half_flat(kh, NKVH) * sin_full.repeat(1, NKVH)
+
+    # Reshape for SDPA: (1, heads, sl, HDIM)
+    q4 = q_roped.view(1, sl, NQH, HDIM).transpose(1, 2).to(torch.bfloat16)
+    k4 = k_roped.view(1, sl, NKVH, HDIM).transpose(1, 2).to(torch.bfloat16)
+    v4 = vh.view(1, sl, NKVH, HDIM).transpose(1, 2).to(torch.bfloat16)
+
+    # GQA: expand K/V to match Q head count
+    k4 = k4.repeat(1, GQA, 1, 1)
+    v4 = v4.repeat(1, GQA, 1, 1)
+
+    # Pad seq dim
+    q4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
+    k4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
+    v4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
+    q4p[:, :, :sl] = q4
+    k4p[:, :, :sl] = k4
+    v4p[:, :, :sl] = v4
+
+    # SDPA (replicated -- all chips run full 32-head attention)
+    attn = ttnn.transformer.scaled_dot_product_attention(
+        rep(q4p, d), rep(k4p, d), rep(v4p, d), is_causal=True)
+
+    # Reshape back and shard across chips for row-parallel O proj
+    ah = rb(attn).view(1, NQH, -1, HDIM)[:, :, :sl, :]
+    ah = ah.transpose(1, 2).contiguous().view(sl, NQH * HDIM).to(torch.bfloat16)
+    ahp = _p(ah)
+    if ahp.shape[0] < sp:
+        ahp = F.pad(ahp, (0, 0, 0, sp - ahp.shape[0]))
+    attn_tt = shd(ahp, d, dim=1)  # each chip gets its 8 heads
+
+    # O projection (row-parallel) + all_reduce
+    o = ttnn.matmul(attn_tt, w[f"{lp}.ow"])
+    o = ttnn.all_reduce(o)
+    return o
 
 
 def dev_moe(h, w, lp, sl, sp, d):
-    """MoE with batched expert matmuls on device.
+    """MoE: all experts compute, weighted by softmax scores, all on device.
 
-    gate_all/up_all are (HIDDEN, NEXPERTS*MOE_INTER) sharded across chips.
-    Each chip computes its 32 experts in one matmul, then we select+weight.
+    Each chip has 32 experts. gate_all/up_all sharded dim=1.
+    After SiLU*mul, multiply by routing weights, then down_all + all_reduce.
     """
-    # Router on device
-    router = ttnn.matmul(h, w[f"{lp}.rw"])  # (sp, NEXPERTS) replicated
+    # Router + softmax on device
+    router = ttnn.matmul(h, w[f"{lp}.rw"])      # (sp, 128) replicated
+    scores = ttnn.softmax(router, dim=-1)         # (sp, 128) replicated
 
-    # Batched gate/up: one big matmul per chip
-    # h: (sp, HIDDEN) replicated, gate_all: (HIDDEN, 32*768) per chip
-    gate_out = ttnn.matmul(h, w[f"{lp}.gate_all"])  # (sp, 32*768) per chip
-    up_out = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 32*768) per chip
+    # Batched gate/up: one matmul per operation across all chip-local experts
+    local_dim = EPC * MOE_INTER  # 32*768 = 24576
+    gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
+    up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
 
     # SiLU(gate) * up via TT-Lang kernel
-    local_expert_dim = EXPERTS_PER_CHIP * MOE_INTER  # 32*768 = 24576
-    act = ztt((sp, local_expert_dim), d)
-    silu_mul_kernel(gate_out, up_out, act)
-
-    # Down projection: (sp, 32*768) @ (32*768, HIDDEN) per chip -> (sp, HIDDEN)
-    down_out = ttnn.matmul(act, w[f"{lp}.down_all"])  # (sp, HIDDEN) per chip
-
-    # All-reduce to sum across chips (each chip computed 32 experts)
-    if N_CHIPS > 1:
-        down_out = ttnn.all_reduce(down_out)
-
-    # Now down_out has the sum of ALL 128 experts applied to ALL tokens
-    # But we need top-k selection! The batched approach computes all experts.
-    # For correctness, we need to weight by routing scores.
-
-    # Read back router logits for weighting (tiny: sl*128 values)
-    rh = rb(router)[:sl, :NEXPERTS].float()
-    scores = torch.softmax(rh, dim=-1)
-
-    # For the batched approach, all experts ran on all tokens.
-    # The output is sum over all experts (via down_all matmul).
-    # This is WRONG for MoE - we need weighted sum of only top-k experts.
-    #
-    # The batched matmul gives: out[tok] = sum_{all experts on chip} silu(tok@gate_e) * (tok@up_e) @ down_e
-    # But MoE wants: out[tok] = sum_{top-k experts} weight_e * silu(tok@gate_e) * (tok@up_e) @ down_e
-    #
-    # To fix this properly we need per-expert intermediate results.
-    # For now: readback the activated tensor, apply routing weights, push back.
-
-    act_h = rb(act)[:sl, :local_expert_dim].to(torch.bfloat16)  # (sl, 32*768) per chip
-    # But with sharding, rb gives us chip 0's data. We need all chips.
-    # Actually with ConcatMeshToTensor dim=0, we get (N_CHIPS*sl, local_expert_dim)
-    # That's not right either for the routing approach.
-
-    # SIMPLER APPROACH: do per-expert matmuls for the active experts only.
-    # Read hidden, run 8 experts on device, weight and sum.
-    hh = rb(h)[:sl, :HIDDEN].to(torch.bfloat16)
-    tw, ti = torch.topk(scores, TOPK, dim=-1)
-    tw = tw / tw.sum(-1, keepdim=True)
-
-    e2t = {}
-    for tok in range(sl):
-        for k in range(TOPK):
-            ei = ti[tok, k].item()
-            wt = tw[tok, k].item()
-            if ei not in e2t:
-                e2t[ei] = []
-            e2t[ei].append((tok, wt))
-
-    out_h = torch.zeros(sl, HIDDEN, dtype=torch.bfloat16)
-    for ei, tinfo in e2t.items():
-        toks = [t[0] for t in tinfo]
-        n = len(toks)
-        np_ = ((n + TILE - 1) // TILE) * TILE
-
-        inp = F.pad(hh[toks], (0, 0, 0, np_ - n))
-        inp_tt = rep(inp, d)
-
-        # Extract this expert's weight columns from the concatenated gate_all/up_all
-        # Expert ei's gate cols: [ei*MOE_INTER : (ei+1)*MOE_INTER] in the full concat
-        # But gate_all is sharded across chips. Expert ei lives on chip ei//32.
-        # We need to slice within that chip's portion.
-        #
-        # This is hard to do with sharded tensors. Use host expert weights instead.
-        gw = w[f"_eh.{lp}.e{ei}.gw"]
-        uw = w[f"_eh.{lp}.e{ei}.uw"]
-        dw_h = w[f"_eh.{lp}.e{ei}.dw"]
-
-        g = ttnn.matmul(inp_tt, rep(gw, d))
-        u = ttnn.matmul(inp_tt, rep(uw, d))
-        ac = ztt((np_, MOE_INTER), d)
-        silu_mul_kernel(g, u, ac)
-        eo = ttnn.matmul(ac, rep(dw_h, d))
-        eoh = rb(eo)[:n, :HIDDEN].to(torch.bfloat16)
-
-        for i, (tok, wt) in enumerate(tinfo):
-            out_h[tok] += eoh[i] * wt
-
-    op = _p(out_h)
-    if op.shape[0] < sp:
-        op = F.pad(op, (0, 0, 0, sp - op.shape[0]))
-    return rep(op, d)
-
-
-# Wait - the approach above stores expert weights on host AND device (duplicated).
-# The gate_all/up_all/down_all on device are wasted if we do per-expert.
-# Let me just do per-expert with the sharded weights on device.
-# I need to rethink this.
-
-# The core problem: MoE routing is dynamic. We can't easily index into sharded
-# tensors across chips. Two clean approaches:
-#
-# A) All experts always compute (wasteful but simple, all on device)
-#    - Needs per-expert weighting BEFORE down_proj, not after
-#    - Requires reshaping intermediate to (sl, NEXPERTS_PER_CHIP, MOE_INTER)
-#
-# B) Per-expert matmuls with replicated expert weights (current approach)
-#    - Expert weights replicated = 4x memory = too much
-#
-# C) Per-expert matmuls with expert weights on only the owning chip
-#    - Need to dispatch tokens to correct chip = complex
-#
-# Let's go with A: run all experts, weight before down_proj.
-# This means: for each token, all 128 experts run, but only top-8 weights are nonzero.
-# The cost is 128/8 = 16x more compute in gate/up, but it's all on device with no routing.
-
-
-def dev_moe_all_experts(h, w, lp, sl, sp, d):
-    """MoE: run ALL experts, weight by routing scores, all on device.
-
-    gate_all: (HIDDEN, NEXPERTS*MOE_INTER) sharded dim=1 -> each chip: (HIDDEN, 32*768)
-    For each token: compute all experts, multiply by routing weight, then down_proj + sum.
-
-    The trick: insert routing weights between activation and down_proj.
-    activated: (sp, 32*768) per chip = (sp, 32, 768) logically
-    Multiply each expert's 768-dim output by its routing weight.
-    Then down_all: (32*768, HIDDEN) per chip sums all expert contributions.
-    """
-    # Router
-    router = ttnn.matmul(h, w[f"{lp}.rw"])  # (sp, NEXPERTS) replicated
-    router_scores = ttnn.softmax(router, dim=-1)  # (sp, NEXPERTS) on device
-
-    # Batched gate/up on device
-    gate_out = ttnn.matmul(h, w[f"{lp}.gate_all"])  # (sp, 32*768) per chip
-    up_out = ttnn.matmul(h, w[f"{lp}.up_all"])
-
-    # SiLU * mul
-    local_dim = EXPERTS_PER_CHIP * MOE_INTER
     act = ztt((sp, local_dim), d)
-    silu_mul_kernel(gate_out, up_out, act)
+    silu_mul_kernel(gate, up, act)
 
-    # Apply routing weights: need to scale each expert's MOE_INTER columns
-    # router_scores: (sp, 128) replicated
-    # Each chip owns experts [chip_id*32 : (chip_id+1)*32]
-    # We need to slice the router scores for this chip's experts and
-    # broadcast-multiply into the activated tensor.
+    # Apply routing weights before down_proj
+    # scores: (sp, 128) replicated. Each chip owns experts [c*32:(c+1)*32].
+    # Need to build (sp, 24576) weight tensor where each expert's 768 columns
+    # are scaled by that expert's routing score.
     #
-    # This requires knowing chip_id at runtime, which is tricky with mesh tensors.
-    # Alternative: readback scores, build weight matrix, push back.
-    rh = rb(router_scores)[:sl, :NEXPERTS].float()
-    # For top-k: zero out non-top-k entries
-    tw, ti = torch.topk(rh, TOPK, dim=-1)
-    tw = tw / tw.sum(-1, keepdim=True)
-    routing_mask = torch.zeros_like(rh)
-    routing_mask.scatter_(1, ti, tw)
-
-    # Build per-chip weight vectors: (sl, 32) per chip, then expand to (sl, 32*768)
-    # Chip c gets routing_mask[:, c*32:(c+1)*32]
-    chip_weights = []
+    # scores layout: [..., e0_score, e1_score, ..., e127_score, ...]
+    # For chip c, need scores[:, c*32:(c+1)*32], expanded to (sp, 32*768)
+    #
+    # Shard scores along expert dim -> each chip gets (sp, 32)
+    # Then expand each score to 768 columns
+    #
+    # ttnn doesn't have repeat_interleave, so build on host and push
+    sh = rb(scores)[:sl, :NEXPERTS].float()
+    # Top-k masking: zero out non-top-k experts, renormalize
+    topk_vals, topk_idx = torch.topk(sh, TOPK, dim=-1)
+    topk_vals = topk_vals / topk_vals.sum(-1, keepdim=True)
+    routing_mask = torch.zeros_like(sh)
+    routing_mask.scatter_(1, topk_idx, topk_vals)
+    routing_mask = routing_mask.to(torch.bfloat16)
+    # Build per-chip expanded weight: (sl, 32) -> (sl, 32*768)
+    chip_scores = []
     for c in range(N_CHIPS):
-        cw = routing_mask[:, c * EXPERTS_PER_CHIP:(c + 1) * EXPERTS_PER_CHIP]  # (sl, 32)
-        # Expand each weight to cover MOE_INTER columns: (sl, 32) -> (sl, 32*768)
-        cw_expanded = cw.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
-        chip_weights.append(cw_expanded.to(torch.bfloat16))
+        cs = routing_mask[:, c*EPC:(c+1)*EPC]  # (sl, 32)
+        cs_exp = cs.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
+        chip_scores.append(cs_exp)
+    all_scores = torch.cat(chip_scores, dim=1)  # (sl, 128*768)
+    asp = _p(all_scores)
+    if asp.shape[0] < sp:
+        asp = F.pad(asp, (0, 0, 0, sp - asp.shape[0]))
+    score_tt = shd(asp, d, dim=1)  # each chip gets (sp, 24576)
 
-    # Stack and shard: (sl, local_dim) per chip
-    weight_tensor = torch.cat(chip_weights, dim=1)  # (sl, 128*768)
-    weight_padded = _p(weight_tensor)
-    if weight_padded.shape[0] < sp:
-        weight_padded = F.pad(weight_padded, (0, 0, 0, sp - weight_padded.shape[0]))
-    weight_tt = shd(weight_padded, d, dim=1)
+    # Weighted activation
+    weighted = ttnn.multiply(act, score_tt)
 
-    # Elementwise multiply: act * weights (both (sp, 32*768) per chip)
-    weighted_act = ttnn.multiply(act, weight_tt)
-
-    # Down projection: (sp, 32*768) @ (32*768, HIDDEN) per chip
-    down_out = ttnn.matmul(weighted_act, w[f"{lp}.down_all"])
-
-    # All-reduce sums contributions from all 4 chips
-    if N_CHIPS > 1:
-        down_out = ttnn.all_reduce(down_out)
-
-    return down_out
+    # Down projection (row-parallel) + all_reduce
+    out = ttnn.matmul(weighted, w[f"{lp}.down_all"])  # (sp, HIDDEN) per chip
+    out = ttnn.all_reduce(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -526,19 +391,12 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
             hs[li] = rb(h)[:sl, :HIDDEN].to(torch.bfloat16)
 
         n = dev_norm(h, w[f"{lp}.in_w"], sp, w, d)
-        q = ttnn.matmul(n, w[f"{lp}.qw"])
-        k = ttnn.matmul(n, w[f"{lp}.kw"])
-        v = ttnn.matmul(n, w[f"{lp}.vw"])
-
-        a = dev_qknorm_rope_sdpa(q, k, v, w[f"{lp}.qnw"], w[f"{lp}.knw"], sl)
-        o = ttnn.matmul(a, w[f"{lp}.ow"])
-        if N_CHIPS > 1:
-            o = ttnn.all_reduce(o)
-        h = dev_add(h, o, sp, d)
+        attn_out = dev_attn(n, w, lp, sl, sp, d)
+        h = dev_add(h, attn_out, sp, d)
 
         nm = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
-        moe = dev_moe_all_experts(nm, w, lp, sl, sp, d)
-        h = dev_add(h, moe, sp, d)
+        moe_out = dev_moe(nm, w, lp, sl, sp, d)
+        h = dev_add(h, moe_out, sp, d)
 
         if (li + 1) % 8 == 0:
             print(f"    layer {li+1}/{TLAYERS}")
@@ -549,16 +407,19 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
 
 
 # ---------------------------------------------------------------------------
-# Draft forward
+# Draft forward (simplified: shares attention pattern with target)
 # ---------------------------------------------------------------------------
 def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
+    """DFlash draft model. Cross-attention uses host reshaping for now."""
     h = noise
     for li in range(DLAYERS):
         lp = f"d.{li}"
         n = dev_norm(h, w[f"{lp}.in_w"], sp, w, d)
 
+        # Cross-attention: Q from draft, K/V from [ctx, draft]
         q = ttnn.matmul(n, w[f"{lp}.qw"])
-        # Cross-attn K/V from [ctx, draft]
+
+        # Concat ctx + draft for K/V (host assist for dynamic concat)
         nh = rb(n)[:sl, :HIDDEN].to(torch.bfloat16)
         ch = rb(ctx)[:ctx_len, :HIDDEN].to(torch.bfloat16)
         kv_in = torch.cat([ch, nh], dim=0)
@@ -572,12 +433,10 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         k = ttnn.matmul(kv, w[f"{lp}.kw"])
         v = ttnn.matmul(kv, w[f"{lp}.vw"])
 
-        # QK norm + RoPE + SDPA for cross-attention
-        nq = NQH_TP if N_CHIPS > 1 else NQH
-        nk = NKVH_TP if N_CHIPS > 1 else NKVH
-        qh = rb(q)[:sl].float().view(1, sl, nq, HDIM).transpose(1, 2)
-        kh = rb(k)[:kv_len].float().view(1, kv_len, nk, HDIM).transpose(1, 2)
-        vh = rb(v)[:kv_len].float().view(1, kv_len, nk, HDIM).transpose(1, 2)
+        # Gather all heads from all chips for QK-norm + RoPE + SDPA
+        qh = rb_dim1(q)[:sl].float().view(1, sl, NQH, HDIM).transpose(1, 2)
+        kh = rb_dim1(k)[:kv_len].float().view(1, kv_len, NKVH, HDIM).transpose(1, 2)
+        vh = rb_dim1(v)[:kv_len].float().view(1, kv_len, NKVH, HDIM).transpose(1, 2)
 
         def hrms(x, wt):
             return (x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + EPS)) * wt.float()
@@ -587,14 +446,15 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         fr = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
         qa = torch.outer(torch.arange(sl, dtype=torch.float32), fr).unsqueeze(0).unsqueeze(0)
         ka = torch.outer(torch.arange(kv_len, dtype=torch.float32), fr).unsqueeze(0).unsqueeze(0)
+        c_q, s_q = torch.cos(qa), torch.sin(qa)
+        c_k, s_k = torch.cos(ka), torch.sin(ka)
         q1, q2 = qh[..., :HDIM//2], qh[..., HDIM//2:]
-        qh = torch.cat([q1*torch.cos(qa) - q2*torch.sin(qa), q2*torch.cos(qa) + q1*torch.sin(qa)], -1)
+        qh = torch.cat([q1*c_q - q2*s_q, q2*c_q + q1*s_q], -1)
         k1, k2 = kh[..., :HDIM//2], kh[..., HDIM//2:]
-        kh = torch.cat([k1*torch.cos(ka) - k2*torch.sin(ka), k2*torch.cos(ka) + k1*torch.sin(ka)], -1)
+        kh = torch.cat([k1*c_k - k2*s_k, k2*c_k + k1*s_k], -1)
 
-        g = nq // nk
-        kh = kh.repeat(1, g, 1, 1)
-        vh = vh.repeat(1, g, 1, 1)
+        kh = kh.repeat(1, GQA, 1, 1)
+        vh = vh.repeat(1, GQA, 1, 1)
 
         def pk4(x, nh, s, total):
             o = torch.zeros(1, nh, total, HDIM, dtype=torch.bfloat16)
@@ -602,38 +462,34 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
             return o
 
         at = ttnn.transformer.scaled_dot_product_attention(
-            rep(pk4(qh, nq, sl, sp), d),
-            rep(pk4(kh, nq, kv_len, kv_sp), d),
-            rep(pk4(vh, nq, kv_len, kv_sp), d),
-            is_causal=False)
+            rep(pk4(qh, NQH, sl, sp), d), rep(pk4(kh, NQH, kv_len, kv_sp), d),
+            rep(pk4(vh, NQH, kv_len, kv_sp), d), is_causal=False)
 
-        ah = rb(at).view(1, nq, -1, HDIM)[:, :, :sl, :]
-        ah = ah.transpose(1, 2).contiguous().view(sl, nq * HDIM).to(torch.bfloat16)
+        ah = rb(at).view(1, NQH, -1, HDIM)[:, :, :sl, :]
+        ah = ah.transpose(1, 2).contiguous().view(sl, NQH * HDIM).to(torch.bfloat16)
         ap = _p(ah)
         if ap.shape[0] < sp:
             ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
-        att = rep(ap, d)
 
-        o = ttnn.matmul(att, w[f"{lp}.ow"])
-        if N_CHIPS > 1:
-            o = ttnn.all_reduce(o)
+        o = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.ow"])
+        o = ttnn.all_reduce(o)
         h = dev_add(h, o, sp, d)
 
         # Dense MLP
         n2 = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
-        fc1 = ttnn.matmul(n2, w[f"{lp}.fc1"])
-        # Split gate/up, SiLU*mul
-        fc1h = rb(fc1)[:sl].to(torch.bfloat16)
-        inter = DINTER // N_CHIPS if N_CHIPS > 1 else DINTER
-        gh, uh = fc1h[:, :inter], fc1h[:, inter:]
-        activated = (torch.nn.functional.silu(gh.float()) * uh.float()).to(torch.bfloat16)
+        fc1 = ttnn.matmul(n2, w[f"{lp}.fc1"])  # sharded dim=1
+
+        # SiLU*mul: gather all chips' gate/up halves
+        fc1h = rb_dim1(fc1)[:sl].to(torch.bfloat16)  # (sl, DINTER*2)
+        half = DINTER
+        g, u = fc1h[:, :half], fc1h[:, half:]
+        activated = (torch.nn.functional.silu(g.float()) * u.float()).to(torch.bfloat16)
         ap = _p(activated)
         if ap.shape[0] < sp:
             ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
 
-        fc2 = ttnn.matmul(rep(ap, d), w[f"{lp}.fc2"])
-        if N_CHIPS > 1:
-            fc2 = ttnn.all_reduce(fc2)
+        fc2 = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.fc2"])
+        fc2 = ttnn.all_reduce(fc2)
         h = dev_add(h, fc2, sp, d)
 
     h = dev_norm(h, w["d.fn_w"], sp, w, d)
@@ -650,11 +506,11 @@ def spec_generate(ids, w, d, max_new=64):
     out = torch.full((pl + max_new + BSIZE,), MASK_ID, dtype=torch.long)
     out[:pl] = ids
 
-    embed_h = w["embed_h"]
+    emb = w["embed_h"]
 
     print("Prefill...")
     t0 = time.time()
-    h = _p(embed_h[ids])
+    h = _p(emb[ids])
     if h.shape[0] < sp:
         h = F.pad(h, (0, 0, 0, sp - h.shape[0]))
     h_tt = rep(h, d)
@@ -663,10 +519,10 @@ def spec_generate(ids, w, d, max_new=64):
     pft = time.time() - t0
     print(f"Prefill: {pft:.1f}s ({pl} tokens)")
 
-    lh = rb(logits)[:pl, :VOCAB].float()
+    lh = rb_dim1(logits)[:pl, :VOCAB].float()
     out[pl] = torch.argmax(lh[-1]).item()
 
-    # Project target context
+    # Project target context for draft
     tf = torch.cat([ths[lid] for lid in TLAYER_IDS], dim=-1)
     tf_sp = ((pl + TILE - 1) // TILE) * TILE
     tf_p = _p(tf)
@@ -684,21 +540,21 @@ def spec_generate(ids, w, d, max_new=64):
         ts = time.time()
         bids = out[start:start + BSIZE].clone()
         bsp = ((BSIZE + TILE - 1) // TILE) * TILE
-        noise = _p(embed_h[bids])
+        noise = _p(emb[bids])
         if noise.shape[0] < bsp:
             noise = F.pad(noise, (0, 0, 0, bsp - noise.shape[0]))
 
         dout = draft_fwd(rep(noise, d), ctx, w, BSIZE, pl, bsp, d)
         dl = ttnn.matmul(dout, w["lm_head"])
-        dlh = rb(dl)[:BSIZE, :VOCAB].float()
+        dlh = rb_dim1(dl)[:BSIZE, :VOCAB].float()
         bids[1:] = torch.argmax(dlh[:-1], dim=-1)
 
         # Verify
-        vh = _p(embed_h[bids])
+        vh = _p(emb[bids])
         if vh.shape[0] < bsp:
             vh = F.pad(vh, (0, 0, 0, bsp - vh.shape[0]))
         vl, vhs = target_fwd(rep(vh, d), w, BSIZE, bsp, d, save_hs=True)
-        vlh = rb(vl)[:BSIZE, :VOCAB].float()
+        vlh = rb_dim1(vl)[:BSIZE, :VOCAB].float()
         post = torch.argmax(vlh, dim=-1)
 
         acc = (bids[1:] == post[:-1]).to(torch.int64).cumprod(0).sum().item()
@@ -710,10 +566,10 @@ def spec_generate(ids, w, d, max_new=64):
 
         if vhs:
             vf = torch.cat([vhs[lid] for lid in TLAYER_IDS], dim=-1)
-            vf_p = _p(vf)
-            if vf_p.shape[0] < bsp:
-                vf_p = F.pad(vf_p, (0, 0, 0, bsp - vf_p.shape[0]))
-            ctx = ttnn.matmul(rep(vf_p, d), w["d.fc"])
+            vfp = _p(vf)
+            if vfp.shape[0] < bsp:
+                vfp = F.pad(vfp, (0, 0, 0, bsp - vfp.shape[0]))
+            ctx = ttnn.matmul(rep(vfp, d), w["d.fc"])
             ctx = dev_norm(ctx, w["d.hn_w"], bsp, w, d)
 
         el = time.time() - ts
@@ -730,7 +586,7 @@ def spec_generate(ids, w, d, max_new=64):
 
 def main():
     print("=" * 60)
-    print(f"DFlash on Tenstorrent ({N_CHIPS} chips, all on device)")
+    print(f"DFlash on Tenstorrent ({N_CHIPS} chips)")
     print("=" * 60)
 
     d = open_dev()
