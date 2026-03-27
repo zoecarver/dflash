@@ -278,17 +278,57 @@ def load_weights(d):
 
 
 # ---------------------------------------------------------------------------
+# Scratch preallocation for traced hot loop
+# ---------------------------------------------------------------------------
+def prealloc_scratch(sp, d):
+    """Pre-allocate all reusable scratch tensors for target_fwd.
+
+    Tensors are reused across layers via output_tensor params to avoid
+    allocation during trace replay.
+    """
+    s = {}
+    # Hidden state (replicated, HIDDEN-wide)
+    def _rep_h(): return rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d)
+    def _shd_q(): return shd(torch.zeros(sp, Q_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
+    def _shd_kv(): return shd(torch.zeros(sp, KV_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
+    def _shd_moe(): return shd(torch.zeros(sp, EPC * MOE_INTER * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
+    def _rep_exp(): return rep(torch.zeros(sp, NEXPERTS, dtype=torch.bfloat16), d)
+
+    # Norm + add outputs (TT-Lang kernels write directly)
+    s["norm"] = _rep_h()
+    s["add"] = _rep_h()
+    # Attention scratch
+    s["q"] = _shd_q()
+    s["k"] = _shd_kv()
+    s["v"] = _shd_kv()
+    s["q_rope"] = _shd_q()
+    s["k_rope"] = _shd_kv()
+    s["o"] = _rep_h()
+    # MoE scratch
+    s["router"] = _rep_exp()
+    s["gate"] = _shd_moe()
+    s["up"] = _shd_moe()
+    s["silu"] = _shd_moe()
+    s["act"] = _shd_moe()
+    s["weighted"] = _shd_moe()
+    s["moe_out"] = _rep_h()
+    s["routing_tt"] = _shd_moe()
+    s["down"] = _rep_h()
+    # Final
+    s["logits"] = shd(torch.zeros(sp, VOCAB, dtype=torch.bfloat16), d, dim=1)
+    return s
+
+
+# ---------------------------------------------------------------------------
 # On-device building blocks
 # ---------------------------------------------------------------------------
-def dev_norm(x, nw_key, w):
+def dev_norm(x, nw_key, w, out):
     """RMSNorm on device. nw_key is key into w for precomputed device weight."""
-    out = ttnn.zeros_like(x)
     rmsnorm_k(x, w[nw_key], w["sc"], w["ms"], out)
     return out
 
 
-def dev_add(a, b):
-    out = ttnn.zeros_like(a)
+def dev_add(a, b, out):
     residual_add_kernel(a, b, out)
     return out
 
@@ -298,132 +338,113 @@ def rb_dim1(t):
     return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=1))
 
 
-def dev_attn(normed, w, lp, sp):
+def dev_attn(normed, w, lp, sp, s):
     """GQA attention. QKV on device, QK-norm + RoPE on device via TT-Lang."""
     # Linear: QKV projections (column-parallel, each chip has its heads)
-    q = ttnn.matmul(normed, w[f"{lp}.qw"])     # (sp, Q_TP=1024) per chip
-    k = ttnn.matmul(normed, w[f"{lp}.kw"])     # (sp, KV_TP=128) per chip
-    v = ttnn.matmul(normed, w[f"{lp}.vw"])     # (sp, KV_TP=128) per chip
+    ttnn.matmul(normed, w[f"{lp}.qw"], optional_output_tensor=s["q"])
+    ttnn.matmul(normed, w[f"{lp}.kw"], optional_output_tensor=s["k"])
+    ttnn.matmul(normed, w[f"{lp}.vw"], optional_output_tensor=s["v"])
 
     # Device: per-head RMSNorm via reshape + ttnn.rms_norm
-    # Reshape (sp, heads*HDIM) -> (sp*heads, HDIM) so each row is one head
-    q_flat = ttnn.reshape(q, (sp * NQH_TP, HDIM))
-    k_flat = ttnn.reshape(k, (sp * NKVH_TP, HDIM))
+    q_flat = ttnn.reshape(s["q"], (sp * NQH_TP, HDIM))
+    k_flat = ttnn.reshape(s["k"], (sp * NKVH_TP, HDIM))
     q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"{lp}.qnw_dev"], epsilon=EPS)
     k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"{lp}.knw_dev"], epsilon=EPS)
     q_normed = ttnn.reshape(q_normed_flat, (sp, NQH_TP * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (sp, NKVH_TP * HDIM))
 
     # Device: RoPE on normed Q and K
-    cos_sp = w["rope_cos_full"]
-    sin_sp = w["rope_sin_adj"]
-    q_roped = ttnn.zeros_like(q)
-    k_roped = ttnn.zeros_like(k)
-    q_rope_k(q_normed, cos_sp, sin_sp, q_roped)
-    k_rope_k(k_normed, cos_sp, sin_sp, k_roped)
+    q_rope_k(q_normed, w["rope_cos_full"], w["rope_sin_adj"], s["q_rope"])
+    k_rope_k(k_normed, w["rope_cos_full"], w["rope_sin_adj"], s["k_rope"])
 
     # Device: reshape for per-chip SDPA
-    # Each chip has NQH_TP=8 Q heads, NKVH_TP=1 KV head -- no cross-chip gather needed
-    q4 = ttnn.reshape(q_roped, (1, sp, NQH_TP, HDIM))
-    q4 = ttnn.transpose(q4, 1, 2)   # (1, NQH_TP, sp, HDIM)
-    k4 = ttnn.reshape(k_roped, (1, sp, NKVH_TP, HDIM))
-    k4 = ttnn.transpose(k4, 1, 2)   # (1, NKVH_TP, sp, HDIM)
-    v4 = ttnn.reshape(v, (1, sp, NKVH_TP, HDIM))
-    v4 = ttnn.transpose(v4, 1, 2)   # (1, NKVH_TP, sp, HDIM)
+    q4 = ttnn.transpose(ttnn.reshape(s["q_rope"], (1, sp, NQH_TP, HDIM)), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(s["k_rope"], (1, sp, NKVH_TP, HDIM)), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(s["v"], (1, sp, NKVH_TP, HDIM)), 1, 2)
 
-    # Per-chip SDPA with GQA: Q(1,8,sp,128) x K(1,1,sp,128) x V(1,1,sp,128)
+    # Per-chip SDPA with GQA
     attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=True)
 
     # Reshape back: (1, NQH_TP, sp, HDIM) -> (sp, NQH_TP*HDIM)
-    attn_2d = ttnn.transpose(attn, 1, 2)  # (1, sp, NQH_TP, HDIM)
-    attn_tt = ttnn.reshape(attn_2d, (sp, NQH_TP * HDIM))
+    attn_tt = ttnn.reshape(ttnn.transpose(attn, 1, 2), (sp, NQH_TP * HDIM))
 
     # Linear: O projection (row-parallel) + collective all_reduce
-    o = ttnn.matmul(attn_tt, w[f"{lp}.ow"])
-    o = ttnn.all_reduce(o)
-    return o
+    ttnn.matmul(attn_tt, w[f"{lp}.ow"], optional_output_tensor=s["o"])
+    return ttnn.all_reduce(s["o"])
 
 
-def dev_moe(h, w, lp):
+def dev_moe(h, w, lp, s):
     """MoE: all experts compute, weighted by top-8 softmax scores, all on device.
 
     Device-only routing: softmax + topk + scatter on replicated scores,
     then matmul-based expansion (replicated @ sharded = sharded).
     """
     # Router + softmax (replicated: all 128 experts needed for correct topk)
-    router = ttnn.matmul(h, w[f"{lp}.rw"])         # (sp, 128) replicated
-    scores = ttnn.softmax(router, dim=-1)            # (sp, 128) replicated
+    ttnn.matmul(h, w[f"{lp}.rw"], optional_output_tensor=s["router"])
+    scores = ttnn.softmax(s["router"], dim=-1)
 
     # Top-8 routing on device
-    topk_vals, topk_idx = ttnn.topk(scores, TOPK)   # (sp, 8) replicated each
-    topk_sum = ttnn.sum(topk_vals, dim=-1, keepdim=True)  # (sp, 1)
-    topk_norm = topk_vals * ttnn.reciprocal(topk_sum)     # normalized top-8 weights
+    topk_vals, topk_idx = ttnn.topk(scores, TOPK)
+    topk_sum = ttnn.sum(topk_vals, dim=-1, keepdim=True)
+    topk_norm = topk_vals * ttnn.reciprocal(topk_sum)
 
     # Scatter into full routing mask
-    routing_mask = ttnn.zeros_like(scores)            # (sp, 128) replicated
-    routing_mask = ttnn.scatter(routing_mask, 1, topk_idx, topk_norm)
+    routing_mask = ttnn.scatter(ttnn.zeros_like(scores), 1, topk_idx, topk_norm)
 
     # Expand via matmul: (sp, 128) @ (128, 24576) -> (sp, 24576) per chip
-    routing_tt = ttnn.matmul(routing_mask, w["moe_expand"])
+    ttnn.matmul(routing_mask, w["moe_expand"], optional_output_tensor=s["routing_tt"])
 
     # Linear: batched gate/up across all chip-local experts
-    gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
-    up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
-    act = ttnn.multiply(ttnn.silu(gate), up)
+    ttnn.matmul(h, w[f"{lp}.gate_all"], optional_output_tensor=s["gate"])
+    ttnn.matmul(h, w[f"{lp}.up_all"], optional_output_tensor=s["up"])
+    ttnn.silu(s["gate"], output_tensor=s["silu"])
+    ttnn.multiply(s["silu"], s["up"], output_tensor=s["act"])
 
     # Apply routing weights
-    weighted = ttnn.multiply(act, routing_tt)
+    ttnn.multiply(s["act"], s["routing_tt"], output_tensor=s["weighted"])
 
     # Linear: down projection (row-parallel) + collective all_reduce
-    out = ttnn.matmul(weighted, w[f"{lp}.down_all"])
-    out = ttnn.all_reduce(out)
-    return out
+    ttnn.matmul(s["weighted"], w[f"{lp}.down_all"], optional_output_tensor=s["moe_out"])
+    return ttnn.all_reduce(s["moe_out"])
 
 
 # ---------------------------------------------------------------------------
 # Target forward
 # ---------------------------------------------------------------------------
-def target_fwd(h, w, sl, sp, d, save_hs=False):
-    hs = {}
+def target_fwd(h, w, sp, d, s):
     for li in range(TLAYERS):
         lp = f"t.{li}"
-        if save_hs and li in TLAYER_IDS:
-            hs[li] = rb(h)[:sl, :HIDDEN].to(torch.bfloat16)
 
-        n = dev_norm(h, f"{lp}.in_w_tt", w)
-        attn_out = dev_attn(n, w, lp, sp)
-        h = dev_add(h, attn_out)
+        n = dev_norm(h, f"{lp}.in_w_tt", w, s["norm"])
+        attn_out = dev_attn(n, w, lp, sp, s)
+        h = dev_add(h, attn_out, s["add"])
 
-        nm = dev_norm(h, f"{lp}.pa_w_tt", w)
-        moe_out = dev_moe(nm, w, lp)
-        h = dev_add(h, moe_out)
+        nm = dev_norm(h, f"{lp}.pa_w_tt", w, s["norm"])
+        moe_out = dev_moe(nm, w, lp, s)
+        h = dev_add(h, moe_out, s["add"])
 
-        if (li + 1) % 8 == 0:
-            print(f"    layer {li+1}/{TLAYERS}")
-
-    fn = dev_norm(h, "final_norm_tt", w)
-    logits = ttnn.matmul(fn, w["lm_head"])  # Linear: lm_head projection
-    return logits, hs
+    fn = dev_norm(h, "final_norm_tt", w, s["norm"])
+    ttnn.matmul(fn, w["lm_head"], optional_output_tensor=s["logits"])
+    return s["logits"]
 
 
 # ---------------------------------------------------------------------------
 # Tracing: preallocate -> compile -> capture -> replay
 # ---------------------------------------------------------------------------
 def prealloc_target_scratch(sp, w, d):
-    """Pre-allocate input tensor and compile target_fwd for tracing.
+    """Pre-allocate all scratch tensors and compile target_fwd for tracing.
 
-    Returns scratch dict with preallocated device tensors.
+    Returns scratch dict with preallocated device tensors and trace state.
     The compile pass triggers JIT compilation of all TT-Lang kernels
     and ttnn op programs so the trace capture has no first-run overhead.
     """
-    scr = {}
+    scr = prealloc_scratch(sp, d)
     scr["sp"] = sp
-    # Preallocate input -- updated via copy_host_to_device_tensor before each replay
+    # Input tensor -- updated via copy_host_to_device_tensor before each replay
     scr["h"] = rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d)
     # Compile pass (warmup)
     print("Compiling target_fwd...")
-    logits, _ = target_fwd(scr["h"], w, sp, sp, d, save_hs=False)
-    scr["logits"] = logits
+    target_fwd(scr["h"], w, sp, d, scr)
     ttnn.synchronize_device(d)
     print("Compilation done.")
     return scr
@@ -434,9 +455,8 @@ def capture_target_trace(scr, w, d):
     sp = scr["sp"]
     print("Capturing trace...")
     tid = ttnn.begin_trace_capture(d, cq_id=0)
-    logits, _ = target_fwd(scr["h"], w, sp, sp, d, save_hs=False)
+    target_fwd(scr["h"], w, sp, d, scr)
     ttnn.end_trace_capture(d, tid, cq_id=0)
-    scr["logits"] = logits  # output buffer reused on replay
     scr["trace_id"] = tid
     print("Trace captured.")
 
@@ -453,7 +473,8 @@ def execute_target_trace(scr, h_host, d):
 
 
 # ---------------------------------------------------------------------------
-# Draft forward (simplified: shares attention pattern with target)
+# Draft forward -- NOT YET MIGRATED to scratch/tracing model.
+# Will break until draft gets its own scratch preallocation.
 # ---------------------------------------------------------------------------
 def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
     """DFlash draft model. Cross-attention uses host reshaping for now."""

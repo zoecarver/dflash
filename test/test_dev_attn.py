@@ -1,15 +1,20 @@
-"""Quick test: run target model via dflash_device.target_fwd and check output tokens."""
+"""Quick test: run target model via traced target_fwd and check output tokens."""
 import time
 import torch
 import torch.nn.functional as F
+import ttnn
 
 TILE = 32
 VOCAB = 151936
+HIDDEN = 2048
 
 
 def main():
     from dflash_device import (load_weights, open_dev, close_dev,
-                                rep, rb_dim1, _p, target_fwd)
+                                rep, rb_dim1, _p,
+                                prealloc_target_scratch,
+                                capture_target_trace,
+                                execute_target_trace)
 
     d = open_dev()
     try:
@@ -33,27 +38,42 @@ def main():
         max_new = 10
         generated = ids.tolist()
 
+        # Fixed sp for tracing
+        max_ctx = len(generated) + max_new
+        sp = ((max_ctx + TILE - 1) // TILE) * TILE
+
+        t0 = time.time()
+        scr = prealloc_target_scratch(sp, w, d)
+        capture_target_trace(scr, w, d)
+        print(f"Prealloc + trace: {time.time()-t0:.1f}s")
+
         for step in range(max_new):
             sl = len(generated)
-            sp = ((sl + TILE - 1) // TILE) * TILE
 
+            t_emb = time.time()
             h = _p(emb[torch.tensor(generated)])
             if h.shape[0] < sp:
                 h = F.pad(h, (0, 0, 0, sp - h.shape[0]))
+            h_host = ttnn.from_torch(h, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+            t_emb = time.time() - t_emb
 
-            t0 = time.time()
-            logits, _ = target_fwd(rep(h, d), w, sl, sp, d)
-            el = time.time() - t0
+            t_fwd = time.time()
+            logits = execute_target_trace(scr, h_host, d)
+            t_fwd = time.time() - t_fwd
 
+            t_tok = time.time()
             lh = rb_dim1(logits)[:sl, :VOCAB].float()
             next_tok = torch.argmax(lh[-1]).item()
+            t_tok = time.time() - t_tok
+
             generated.append(next_tok)
 
             try:
                 tok_str = tok.decode([next_tok])
             except:
                 tok_str = f"<{next_tok}>"
-            print(f"  step {step}: tok={next_tok} '{tok_str}' ({el:.1f}s, ctx={sl})")
+            print(f"  step {step}: tok={next_tok} '{tok_str}' "
+                  f"(emb={t_emb:.3f}s fwd={t_fwd:.3f}s tok={t_tok:.3f}s ctx={sl})")
 
             if next_tok in (151643, 151645):
                 break
