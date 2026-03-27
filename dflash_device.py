@@ -314,39 +314,21 @@ def dev_attn(normed, w, lp, sl, sp, d):
     q_rope_k(q_normed, cos_sp, sin_sp, q_roped)
     k_rope_k(k_normed, cos_sp, sin_sp, k_roped)
 
-    # Host: readback for SDPA reshape
-    qh = rb_dim1(q_roped)[:sl].to(torch.bfloat16)
-    kh = rb_dim1(k_roped)[:sl].to(torch.bfloat16)
-    vh = rb_dim1(v)[:sl].to(torch.bfloat16)
+    # Device: reshape for per-chip SDPA
+    # Each chip has NQH_TP=8 Q heads, NKVH_TP=1 KV head -- no cross-chip gather needed
+    q4 = ttnn.reshape(q_roped, (1, sp, NQH_TP, HDIM))
+    q4 = ttnn.transpose(q4, 1, 2)   # (1, NQH_TP, sp, HDIM)
+    k4 = ttnn.reshape(k_roped, (1, sp, NKVH_TP, HDIM))
+    k4 = ttnn.transpose(k4, 1, 2)   # (1, NKVH_TP, sp, HDIM)
+    v4 = ttnn.reshape(v, (1, sp, NKVH_TP, HDIM))
+    v4 = ttnn.transpose(v4, 1, 2)   # (1, NKVH_TP, sp, HDIM)
 
-    # Reshape for SDPA: (1, heads, sl, HDIM)
-    q4 = qh.view(1, sl, NQH, HDIM).transpose(1, 2)
-    k4 = kh.view(1, sl, NKVH, HDIM).transpose(1, 2)
-    v4 = vh.view(1, sl, NKVH, HDIM).transpose(1, 2)
+    # Per-chip SDPA with GQA: Q(1,8,sp,128) x K(1,1,sp,128) x V(1,1,sp,128)
+    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=True)
 
-    # GQA: expand K/V to match Q head count (interleave, not tile)
-    k4 = k4.repeat_interleave(GQA, dim=1)
-    v4 = v4.repeat_interleave(GQA, dim=1)
-
-    # Pad seq dim
-    q4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
-    k4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
-    v4p = torch.zeros(1, NQH, sp, HDIM, dtype=torch.bfloat16)
-    q4p[:, :, :sl] = q4
-    k4p[:, :, :sl] = k4
-    v4p[:, :, :sl] = v4
-
-    # SDPA (replicated, all chips run full 32-head attention)
-    attn = ttnn.transformer.scaled_dot_product_attention(
-        rep(q4p, d), rep(k4p, d), rep(v4p, d), is_causal=True)
-
-    # Reshape back and shard across chips for row-parallel O proj
-    ah = rb(attn).view(1, NQH, -1, HDIM)[:, :, :sl, :]
-    ah = ah.transpose(1, 2).contiguous().view(sl, NQH * HDIM).to(torch.bfloat16)
-    ahp = _p(ah)
-    if ahp.shape[0] < sp:
-        ahp = F.pad(ahp, (0, 0, 0, sp - ahp.shape[0]))
-    attn_tt = shd(ahp, d, dim=1)  # each chip gets its 8 heads
+    # Reshape back: (1, NQH_TP, sp, HDIM) -> (sp, NQH_TP*HDIM)
+    attn_2d = ttnn.transpose(attn, 1, 2)  # (1, sp, NQH_TP, HDIM)
+    attn_tt = ttnn.reshape(attn_2d, (sp, NQH_TP * HDIM))
 
     # Linear: O projection (row-parallel) + collective all_reduce
     o = ttnn.matmul(attn_tt, w[f"{lp}.ow"])
