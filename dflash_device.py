@@ -285,36 +285,39 @@ def prealloc_scratch(sp, d):
 
     Tensors are reused across layers via output_tensor params to avoid
     allocation during trace replay.
-    """
-    s = {}
-    # Hidden state (replicated, HIDDEN-wide)
-    def _rep_h(): return rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d)
-    def _shd_q(): return shd(torch.zeros(sp, Q_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
-    def _shd_kv(): return shd(torch.zeros(sp, KV_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
-    def _shd_moe(): return shd(torch.zeros(sp, EPC * MOE_INTER * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
-    def _rep_exp(): return rep(torch.zeros(sp, NEXPERTS, dtype=torch.bfloat16), d)
 
-    # Norm + add outputs (TT-Lang kernels write directly)
-    s["norm"] = _rep_h()
-    s["add"] = _rep_h()
-    # Attention scratch
-    s["q"] = _shd_q()
-    s["k"] = _shd_kv()
-    s["v"] = _shd_kv()
-    s["q_rope"] = _shd_q()
-    s["k_rope"] = _shd_kv()
-    s["o"] = _rep_h()
-    # MoE scratch
-    s["router"] = _rep_exp()
+    Hot, small tensors go in L1 for lower latency between ops.
+    Large tensors (MoE activations, logits) stay in DRAM.
+    """
+    L1 = ttnn.L1_MEMORY_CONFIG
+    s = {}
+    # Helpers -- L1 for small/hot, DRAM for large
+    def _rep_h_l1(): return rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d, mem=L1)
+    def _shd_q_l1(): return shd(torch.zeros(sp, Q_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1, mem=L1)
+    def _shd_kv_l1(): return shd(torch.zeros(sp, KV_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1, mem=L1)
+    def _shd_moe(): return shd(torch.zeros(sp, EPC * MOE_INTER * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
+
+    # Norm + add outputs: L1 (128KB each, read/written every layer)
+    s["norm"] = _rep_h_l1()
+    s["add"] = _rep_h_l1()
+    # Attention scratch: Q/K/V and RoPE outputs in L1
+    s["q"] = _shd_q_l1()       # (sp, 1024) per chip = 64KB
+    s["k"] = _shd_kv_l1()      # (sp, 128) per chip = 8KB
+    s["v"] = _shd_kv_l1()      # (sp, 128) per chip = 8KB
+    s["q_rope"] = _shd_q_l1()  # 64KB
+    s["k_rope"] = _shd_kv_l1() # 8KB
+    s["o"] = _rep_h_l1()       # 128KB
+    # MoE scratch: router in L1 (8KB), activations in DRAM (1.5MB each)
+    s["router"] = rep(torch.zeros(sp, NEXPERTS, dtype=torch.bfloat16), d, mem=L1)
     s["gate"] = _shd_moe()
     s["up"] = _shd_moe()
     s["silu"] = _shd_moe()
     s["act"] = _shd_moe()
     s["weighted"] = _shd_moe()
-    s["moe_out"] = _rep_h()
+    s["moe_out"] = _rep_h_l1()  # 128KB
     s["routing_tt"] = _shd_moe()
-    s["down"] = _rep_h()
-    # Final
+    s["down"] = _rep_h_l1()     # 128KB
+    # Final: logits in DRAM (large)
     s["logits"] = shd(torch.zeros(sp, VOCAB, dtype=torch.bfloat16), d, dim=1)
     return s
 
@@ -354,8 +357,8 @@ def dev_attn(normed, w, lp, sp, s):
     k_normed = ttnn.reshape(k_normed_flat, (sp, NKVH_TP * HDIM))
 
     # Device: RoPE on normed Q and K
-    q_rope_k(q_normed, w["rope_cos_full"], w["rope_sin_adj"], s["q_rope"])
-    k_rope_k(k_normed, w["rope_cos_full"], w["rope_sin_adj"], s["k_rope"])
+    q_rope_k(q_normed, w["rope_cos_sp"], w["rope_sin_sp"], s["q_rope"])
+    k_rope_k(k_normed, w["rope_cos_sp"], w["rope_sin_sp"], s["k_rope"])
 
     # Device: reshape for per-chip SDPA
     q4 = ttnn.transpose(ttnn.reshape(s["q_rope"], (1, sp, NQH_TP, HDIM)), 1, 2)
@@ -442,6 +445,11 @@ def prealloc_target_scratch(sp, w, d):
     scr["sp"] = sp
     # Input tensor -- updated via copy_host_to_device_tensor before each replay
     scr["h"] = rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d)
+    # RoPE tables trimmed to sp rows and placed in L1 (8KB each vs 1MB in DRAM)
+    cos_full_host = rb(w["rope_cos_full"])[:sp].to(torch.bfloat16)
+    sin_adj_host = rb(w["rope_sin_adj"])[:sp].to(torch.bfloat16)
+    w["rope_cos_sp"] = rep(cos_full_host, d, mem=ttnn.L1_MEMORY_CONFIG)
+    w["rope_sin_sp"] = rep(sin_adj_host, d, mem=ttnn.L1_MEMORY_CONFIG)
     # Compile pass (warmup)
     print("Compiling target_fwd...")
     target_fwd(scr["h"], w, sp, d, scr)
