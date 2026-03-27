@@ -407,6 +407,52 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
 
 
 # ---------------------------------------------------------------------------
+# Tracing: preallocate -> compile -> capture -> replay
+# ---------------------------------------------------------------------------
+def prealloc_target_scratch(sp, w, d):
+    """Pre-allocate input tensor and compile target_fwd for tracing.
+
+    Returns scratch dict with preallocated device tensors.
+    The compile pass triggers JIT compilation of all TT-Lang kernels
+    and ttnn op programs so the trace capture has no first-run overhead.
+    """
+    scr = {}
+    scr["sp"] = sp
+    # Preallocate input -- updated via copy_host_to_device_tensor before each replay
+    scr["h"] = rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d)
+    # Compile pass (warmup)
+    print("Compiling target_fwd...")
+    logits, _ = target_fwd(scr["h"], w, sp, sp, d, save_hs=False)
+    scr["logits"] = logits
+    ttnn.synchronize_device(d)
+    print("Compilation done.")
+    return scr
+
+
+def capture_target_trace(scr, w, d):
+    """Capture trace of target_fwd. Must call prealloc_target_scratch first."""
+    sp = scr["sp"]
+    print("Capturing trace...")
+    tid = ttnn.begin_trace_capture(d, cq_id=0)
+    logits, _ = target_fwd(scr["h"], w, sp, sp, d, save_hs=False)
+    ttnn.end_trace_capture(d, tid, cq_id=0)
+    scr["logits"] = logits  # output buffer reused on replay
+    scr["trace_id"] = tid
+    print("Trace captured.")
+
+
+def execute_target_trace(scr, h_host, d):
+    """Execute traced target_fwd with new input.
+
+    h_host: ttnn host tensor (from ttnn.from_torch with no device)
+    """
+    ttnn.copy_host_to_device_tensor(h_host, scr["h"])
+    ttnn.execute_trace(d, scr["trace_id"], cq_id=0, blocking=False)
+    ttnn.synchronize_device(d)
+    return scr["logits"]
+
+
+# ---------------------------------------------------------------------------
 # Draft forward (simplified: shares attention pattern with target)
 # ---------------------------------------------------------------------------
 def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
