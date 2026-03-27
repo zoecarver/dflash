@@ -143,6 +143,14 @@ def load_weights(d):
     # Per-head norm support for TT-Lang q_head_norm_k/k_head_norm_k (unused, see PCC note above)
     w["ms_head"] = rep(torch.full((TILE, TILE), 1.0 / HDIM, dtype=torch.bfloat16), d)
 
+    # MoE routing expansion matrix: maps (sp, 128) routing mask to (sp, 24576) per chip
+    # Each expert's scalar weight is broadcast across MOE_INTER=768 columns via matmul
+    # replicated @ sharded_dim1 = sharded_dim1 (same pattern as QKV projections)
+    expand = torch.zeros(NEXPERTS, NEXPERTS * MOE_INTER, dtype=torch.bfloat16)
+    for e in range(NEXPERTS):
+        expand[e, e * MOE_INTER:(e + 1) * MOE_INTER] = 1.0
+    w["moe_expand"] = shd(expand, d, dim=1)  # (128, 24576) per chip
+
     # RoPE tables (replicated)
     max_seq = 4096
     freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
@@ -200,7 +208,7 @@ def load_weights(d):
         w[f"{lp}.qnw_dev"] = rep(qnw_raw.unsqueeze(0).contiguous(), d)
         w[f"{lp}.knw_dev"] = rep(knw_raw.unsqueeze(0).contiguous(), d)
 
-        # Router: replicated
+        # Router: replicated (softmax needs all 128 experts)
         w[f"{lp}.rw"] = rep(gt(f"{p}.mlp.gate.weight").T.contiguous().to(torch.bfloat16), d)
 
         # Expert weights: concat all then shard across chips
@@ -290,7 +298,7 @@ def rb_dim1(t):
     return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=1))
 
 
-def dev_attn(normed, w, lp, sl, sp, d):
+def dev_attn(normed, w, lp, sp):
     """GQA attention. QKV on device, QK-norm + RoPE on device via TT-Lang."""
     # Linear: QKV projections (column-parallel, each chip has its heads)
     q = ttnn.matmul(normed, w[f"{lp}.qw"])     # (sp, Q_TP=1024) per chip
@@ -336,47 +344,34 @@ def dev_attn(normed, w, lp, sl, sp, d):
     return o
 
 
-def dev_moe(h, w, lp, sl, sp, d):
-    """MoE: all experts compute, weighted by softmax scores, all on device.
+def dev_moe(h, w, lp):
+    """MoE: all experts compute, weighted by top-8 softmax scores, all on device.
 
-    Each chip has 32 experts. gate_all/up_all sharded dim=1.
-    After SiLU*mul, multiply by routing weights, then down_all + all_reduce.
+    Device-only routing: softmax + topk + scatter on replicated scores,
+    then matmul-based expansion (replicated @ sharded = sharded).
     """
-    # Linear: router projection
-    router = ttnn.matmul(h, w[f"{lp}.rw"])      # (sp, 128) replicated
-    # ttnn: softmax could be TT-Lang but scores are read back for topk anyway
-    scores = ttnn.softmax(router, dim=-1)         # (sp, 128) replicated
+    # Router + softmax (replicated: all 128 experts needed for correct topk)
+    router = ttnn.matmul(h, w[f"{lp}.rw"])         # (sp, 128) replicated
+    scores = ttnn.softmax(router, dim=-1)            # (sp, 128) replicated
+
+    # Top-8 routing on device
+    topk_vals, topk_idx = ttnn.topk(scores, TOPK)   # (sp, 8) replicated each
+    topk_sum = ttnn.sum(topk_vals, dim=-1, keepdim=True)  # (sp, 1)
+    topk_norm = topk_vals * ttnn.reciprocal(topk_sum)     # normalized top-8 weights
+
+    # Scatter into full routing mask
+    routing_mask = ttnn.zeros_like(scores)            # (sp, 128) replicated
+    routing_mask = ttnn.scatter(routing_mask, 1, topk_idx, topk_norm)
+
+    # Expand via matmul: (sp, 128) @ (128, 24576) -> (sp, 24576) per chip
+    routing_tt = ttnn.matmul(routing_mask, w["moe_expand"])
 
     # Linear: batched gate/up across all chip-local experts
-    local_dim = EPC * MOE_INTER  # 32*768 = 24576
     gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
     up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
-
-    # SiLU(gate) * up on device
     act = ttnn.multiply(ttnn.silu(gate), up)
 
-    # Host: topk routing (requires conditional logic not available in TT-Lang)
-    sh = rb(scores)[:sl, :NEXPERTS].float()
-    topk_vals, topk_idx = torch.topk(sh, TOPK, dim=-1)
-    topk_vals = topk_vals / topk_vals.sum(-1, keepdim=True)
-    routing_mask = torch.zeros_like(sh)
-    routing_mask.scatter_(1, topk_idx, topk_vals)
-
-    # Expand routing weights per chip and upload sharded
-    # Each expert's scalar weight broadcast across MOE_INTER=768 columns
-    expanded_parts = []
-    for c in range(N_CHIPS):
-        cs = routing_mask[:, c * EPC:(c + 1) * EPC]
-        cs_exp = cs.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
-        expanded_parts.append(cs_exp.to(torch.bfloat16))
-    all_expanded = torch.cat(expanded_parts, dim=1)
-    ep = _p(all_expanded)
-    if ep.shape[0] < sp:
-        ep = F.pad(ep, (0, 0, 0, sp - ep.shape[0]))
-    routing_tt = shd(ep, d, dim=1)
-
-    # Device: apply routing weights (eliminates activation readback)
-    # TODO: silu_mul_weight_kernel would fuse this into one kernel but has PCC issues on large tensors
+    # Apply routing weights
     weighted = ttnn.multiply(act, routing_tt)
 
     # Linear: down projection (row-parallel) + collective all_reduce
@@ -396,11 +391,11 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
             hs[li] = rb(h)[:sl, :HIDDEN].to(torch.bfloat16)
 
         n = dev_norm(h, f"{lp}.in_w_tt", w)
-        attn_out = dev_attn(n, w, lp, sl, sp, d)
+        attn_out = dev_attn(n, w, lp, sp)
         h = dev_add(h, attn_out)
 
         nm = dev_norm(h, f"{lp}.pa_w_tt", w)
-        moe_out = dev_moe(nm, w, lp, sl, sp, d)
+        moe_out = dev_moe(nm, w, lp)
         h = dev_add(h, moe_out)
 
         if (li + 1) % 8 == 0:
