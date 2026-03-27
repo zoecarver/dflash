@@ -11,7 +11,7 @@ HIDDEN = 2048
 
 def main():
     from dflash_device import (load_weights, open_dev, close_dev, _p,
-                                rb_dim1,
+                                rb_dim1, rb,
                                 prealloc_target_scratch,
                                 capture_target_trace,
                                 execute_target_trace)
@@ -62,8 +62,10 @@ def main():
             t_fwd = time.time() - t_fwd
 
             t_tok = time.time()
-            lh = rb_dim1(logits)[:sl, :VOCAB].float()
-            next_tok = torch.argmax(lh[-1]).item()
+            # Device-side argmax, then read back just the indices (not full logits)
+            argmax_ids = ttnn.argmax(logits, dim=-1)
+            argmax_host = rb(argmax_ids)
+            next_tok = int(argmax_host[sl - 1].item())
             t_tok = time.time() - t_tok
 
             generated.append(next_tok)
