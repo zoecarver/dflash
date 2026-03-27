@@ -221,7 +221,8 @@ def load_weights(d):
             gw = f.get_tensor(f"{dp}.mlp.gate_proj.weight").T.contiguous().to(torch.bfloat16)
             uw = f.get_tensor(f"{dp}.mlp.up_proj.weight").T.contiguous().to(torch.bfloat16)
             fc2 = f.get_tensor(f"{dp}.mlp.down_proj.weight").T.contiguous().to(torch.bfloat16)
-            w[f"{lp}.fc1"] = shd(torch.cat([gw, uw], dim=1), d, dim=1)
+            w[f"{lp}.gw"] = shd(gw, d, dim=1)
+            w[f"{lp}.uw"] = shd(uw, d, dim=1)
             w[f"{lp}.fc2"] = shd(fc2, d, dim=0)
 
     print(f"All weights loaded in {time.time()-t0:.0f}s")
@@ -472,20 +473,13 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
 
         # Dense MLP
         n2 = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
-        fc1 = ttnn.matmul(n2, w[f"{lp}.fc1"])  # Linear: gate+up (sharded dim=1)
-
-        # Host: SiLU*mul split -- fc1 is [gate|up] concatenated, need to split then
-        # apply silu(gate)*up. Could use silu_mul_kernel if gate/up were separate matmuls.
-        fc1h = rb_dim1(fc1)[:sl].to(torch.bfloat16)  # (sl, DINTER*2)
-        half = DINTER
-        g, u = fc1h[:, :half], fc1h[:, half:]
-        activated = (torch.nn.functional.silu(g.float()) * u.float()).to(torch.bfloat16)
-        ap = _p(activated)
-        if ap.shape[0] < sp:
-            ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
-
+        gate = ttnn.matmul(n2, w[f"{lp}.gw"])  # Linear: gate (column-parallel)
+        up = ttnn.matmul(n2, w[f"{lp}.uw"])     # Linear: up (column-parallel)
+        # TT-Lang: fused silu(gate) * up (avoids host readback)
+        activated = shd(torch.zeros(sp, DINTER, dtype=torch.bfloat16), d, dim=1)
+        silu_mul_kernel(gate, up, activated)
         # Linear: down projection (row-parallel) + collective all_reduce
-        fc2 = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.fc2"])
+        fc2 = ttnn.matmul(activated, w[f"{lp}.fc2"])
         fc2 = ttnn.all_reduce(fc2)
         h = dev_add(h, fc2, sp, d)
 
