@@ -80,11 +80,12 @@ def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
                         with x_dfb.reserve() as blk:
                             tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
                     # Pass 2: x tiles + weight tiles for normalize
+                    # Weight is (1, dim_tiles) -- same for all sequence positions
                     for j in range(dim_tiles):
                         with x_dfb.reserve() as blk:
                             tx = ttl.copy(x[tile_idx, j], blk); tx.wait()
                         with w_dfb.reserve() as blk:
-                            tx = ttl.copy(weight[tile_idx, j], blk); tx.wait()
+                            tx = ttl.copy(weight[0, j], blk); tx.wait()
 
         @ttl.datamovement()
         def dm_write():

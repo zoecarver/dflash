@@ -233,10 +233,12 @@ def load_weights(d):
 # On-device building blocks
 # ---------------------------------------------------------------------------
 def dev_norm(x, nw, sp, w, d):
-    # ttnn: TT-Lang rmsnorm kernel has known ~3x scaling bug in reduce+broadcast
-    we = nw.unsqueeze(0).contiguous()  # (1, HIDDEN)
+    # TT-Lang rmsnorm: expand weight to TILE rows so all rows in a tile see values
+    we = nw.unsqueeze(0).expand(TILE, -1).contiguous().to(torch.bfloat16)
     weight_tt = rep(we, d)
-    return ttnn.rms_norm(x, weight=weight_tt, epsilon=EPS)
+    out = ztt((sp, HIDDEN), d)
+    rmsnorm_k(x, weight_tt, w["sc"], w["ms"], out)
+    return out
 
 
 def dev_add(a, b, sp, d):
