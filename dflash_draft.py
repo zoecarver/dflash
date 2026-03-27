@@ -126,8 +126,8 @@ def setup_rope_tables(w, ctx_sp, d):
     ctx_sp: tile-padded context rows. kv_sp = ctx_sp + SP (context + draft).
     """
     kv_sp = ctx_sp + SP
-    w["rope_cos_q"] = to_dev(w["rope_cos_full"][:SP], d)
-    w["rope_sin_q"] = to_dev(w["rope_sin_full"][:SP], d)
+    w["rope_cos_q"] = to_dev(w["rope_cos_full"][ctx_sp:ctx_sp + SP], d)
+    w["rope_sin_q"] = to_dev(w["rope_sin_full"][ctx_sp:ctx_sp + SP], d)
     w["rope_cos_kv"] = to_dev(w["rope_cos_full"][:kv_sp], d)
     w["rope_sin_kv"] = to_dev(w["rope_sin_full"][:kv_sp], d)
     w["kv_sp"] = kv_sp
