@@ -232,6 +232,7 @@ def load_weights(d):
 # On-device building blocks
 # ---------------------------------------------------------------------------
 def dev_norm(x, nw, sp, w, d):
+    # ttnn: TT-Lang rmsnorm kernel has known ~3x scaling bug in reduce+broadcast
     we = nw.unsqueeze(0).contiguous()  # (1, HIDDEN)
     weight_tt = rep(we, d)
     return ttnn.rms_norm(x, weight=weight_tt, epsilon=EPS)
@@ -250,12 +251,15 @@ def rb_dim1(t):
 
 def dev_attn(normed, w, lp, sl, sp, d):
     """GQA attention. QKV on device (column-parallel), QK-norm + RoPE on host."""
-    # QKV projections (column-parallel: each chip has its heads)
+    # Linear: QKV projections (column-parallel, each chip has its heads)
     q = ttnn.matmul(normed, w[f"{lp}.qw"])     # (sp, Q_TP=1024) per chip
     k = ttnn.matmul(normed, w[f"{lp}.kw"])     # (sp, KV_TP=128) per chip
     v = ttnn.matmul(normed, w[f"{lp}.vw"])     # (sp, KV_TP=128) per chip
 
-    # Gather all heads from all chips (concat along column/head dim)
+    # Host: gather all heads for QK-norm + RoPE.
+    # These stay on host because QK-norm uses per-head RMSNorm (same reduce+broadcast
+    # pattern as the buggy TT-Lang rmsnorm) and RoPE needs rotate_half which requires
+    # cross-tile data shuffling not yet supported in TT-Lang.
     qh = rb_dim1(q)[:sl].float()    # (sl, NQH*HDIM=4096) all 32 Q heads
     kh = rb_dim1(k)[:sl].float()    # (sl, NKVH*HDIM=512) all 4 KV heads
     vh = rb_dim1(v)[:sl].float()    # (sl, NKVH*HDIM=512)
@@ -303,7 +307,7 @@ def dev_attn(normed, w, lp, sl, sp, d):
     k4p[:, :, :sl] = k4
     v4p[:, :, :sl] = v4
 
-    # SDPA (replicated -- all chips run full 32-head attention)
+    # SDPA (replicated, all chips run full 32-head attention)
     attn = ttnn.transformer.scaled_dot_product_attention(
         rep(q4p, d), rep(k4p, d), rep(v4p, d), is_causal=True)
 
@@ -315,7 +319,7 @@ def dev_attn(normed, w, lp, sl, sp, d):
         ahp = F.pad(ahp, (0, 0, 0, sp - ahp.shape[0]))
     attn_tt = shd(ahp, d, dim=1)  # each chip gets its 8 heads
 
-    # O projection (row-parallel) + all_reduce
+    # Linear: O projection (row-parallel) + collective all_reduce
     o = ttnn.matmul(attn_tt, w[f"{lp}.ow"])
     o = ttnn.all_reduce(o)
     return o
@@ -327,11 +331,12 @@ def dev_moe(h, w, lp, sl, sp, d):
     Each chip has 32 experts. gate_all/up_all sharded dim=1.
     After SiLU*mul, multiply by routing weights, then down_all + all_reduce.
     """
-    # Router + softmax on device
+    # Linear: router projection
     router = ttnn.matmul(h, w[f"{lp}.rw"])      # (sp, 128) replicated
+    # ttnn: softmax could be TT-Lang but scores are read back for topk anyway
     scores = ttnn.softmax(router, dim=-1)         # (sp, 128) replicated
 
-    # Batched gate/up: one matmul per operation across all chip-local experts
+    # Linear: batched gate/up across all chip-local experts
     local_dim = EPC * MOE_INTER  # 32*768 = 24576
     gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
     up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
@@ -362,7 +367,7 @@ def dev_moe(h, w, lp, sl, sp, d):
     weighted = shd(torch.zeros(sp, total_cols, dtype=torch.bfloat16), d, dim=1)
     silu_mul_weight_kernel(gate, up, routing_tt, weighted)
 
-    # Down projection (row-parallel) + all_reduce
+    # Linear: down projection (row-parallel) + collective all_reduce
     out = ttnn.matmul(weighted, w[f"{lp}.down_all"])
     out = ttnn.all_reduce(out)
     return out
@@ -390,7 +395,7 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
             print(f"    layer {li+1}/{TLAYERS}")
 
     fn = dev_norm(h, w["final_norm"], sp, w, d)
-    logits = ttnn.matmul(fn, w["lm_head"])
+    logits = ttnn.matmul(fn, w["lm_head"])  # Linear: lm_head projection
     return logits, hs
 
 
@@ -404,10 +409,10 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         lp = f"d.{li}"
         n = dev_norm(h, w[f"{lp}.in_w"], sp, w, d)
 
-        # Cross-attention: Q from draft, K/V from [ctx, draft]
+        # Linear: cross-attention Q from draft, K/V from [ctx, draft]
         q = ttnn.matmul(n, w[f"{lp}.qw"])
 
-        # Concat ctx + draft for K/V (host assist for dynamic concat)
+        # Host: concat ctx + draft for K/V (dynamic-length concat not in TT-Lang)
         nh = rb(n)[:sl, :HIDDEN].to(torch.bfloat16)
         ch = rb(ctx)[:ctx_len, :HIDDEN].to(torch.bfloat16)
         kv_in = torch.cat([ch, nh], dim=0)
@@ -418,10 +423,10 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
             kv_p = F.pad(kv_p, (0, 0, 0, kv_sp - kv_p.shape[0]))
         kv = rep(kv_p, d)
 
-        k = ttnn.matmul(kv, w[f"{lp}.kw"])
-        v = ttnn.matmul(kv, w[f"{lp}.vw"])
+        k = ttnn.matmul(kv, w[f"{lp}.kw"])  # Linear
+        v = ttnn.matmul(kv, w[f"{lp}.vw"])  # Linear
 
-        # Gather all heads from all chips for QK-norm + RoPE + SDPA
+        # Host: gather all heads for QK-norm + RoPE (same reasons as dev_attn)
         qh = rb_dim1(q)[:sl].float().view(1, sl, NQH, HDIM).transpose(1, 2)
         kh = rb_dim1(k)[:kv_len].float().view(1, kv_len, NKVH, HDIM).transpose(1, 2)
         vh = rb_dim1(v)[:kv_len].float().view(1, kv_len, NKVH, HDIM).transpose(1, 2)
@@ -449,6 +454,7 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
             o[:, :, :s] = x.to(torch.bfloat16)
             return o
 
+        # SDPA (replicated cross-attention)
         at = ttnn.transformer.scaled_dot_product_attention(
             rep(pk4(qh, NQH, sl, sp), d), rep(pk4(kh, NQH, kv_len, kv_sp), d),
             rep(pk4(vh, NQH, kv_len, kv_sp), d), is_causal=False)
@@ -459,15 +465,17 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         if ap.shape[0] < sp:
             ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
 
+        # Linear: O projection (row-parallel) + collective all_reduce
         o = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.ow"])
         o = ttnn.all_reduce(o)
         h = dev_add(h, o, sp, d)
 
         # Dense MLP
         n2 = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
-        fc1 = ttnn.matmul(n2, w[f"{lp}.fc1"])  # sharded dim=1
+        fc1 = ttnn.matmul(n2, w[f"{lp}.fc1"])  # Linear: gate+up (sharded dim=1)
 
-        # SiLU*mul: gather all chips' gate/up halves
+        # Host: SiLU*mul split -- fc1 is [gate|up] concatenated, need to split then
+        # apply silu(gate)*up. Could use silu_mul_kernel if gate/up were separate matmuls.
         fc1h = rb_dim1(fc1)[:sl].to(torch.bfloat16)  # (sl, DINTER*2)
         half = DINTER
         g, u = fc1h[:, :half], fc1h[:, half:]
@@ -476,6 +484,7 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         if ap.shape[0] < sp:
             ap = F.pad(ap, (0, 0, 0, sp - ap.shape[0]))
 
+        # Linear: down projection (row-parallel) + collective all_reduce
         fc2 = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.fc2"])
         fc2 = ttnn.all_reduce(fc2)
         h = dev_add(h, fc2, sp, d)
@@ -516,7 +525,7 @@ def spec_generate(ids, w, d, max_new=64):
     tf_p = _p(tf)
     if tf_p.shape[0] < tf_sp:
         tf_p = F.pad(tf_p, (0, 0, 0, tf_sp - tf_p.shape[0]))
-    ctx = ttnn.matmul(rep(tf_p, d), w["d.fc"])
+    ctx = ttnn.matmul(rep(tf_p, d), w["d.fc"])  # Linear: project target hidden states
     ctx = dev_norm(ctx, w["d.hn_w"], tf_sp, w, d)
 
     start = pl
@@ -533,7 +542,7 @@ def spec_generate(ids, w, d, max_new=64):
             noise = F.pad(noise, (0, 0, 0, bsp - noise.shape[0]))
 
         dout = draft_fwd(rep(noise, d), ctx, w, BSIZE, pl, bsp, d)
-        dl = ttnn.matmul(dout, w["lm_head"])
+        dl = ttnn.matmul(dout, w["lm_head"])  # Linear: draft lm_head
         dlh = rb_dim1(dl)[:BSIZE, :VOCAB].float()
         bids[1:] = torch.argmax(dlh[:-1], dim=-1)
 
@@ -563,7 +572,7 @@ def spec_generate(ids, w, d, max_new=64):
             vfp = _p(vf)
             if vfp.shape[0] < vsp:
                 vfp = F.pad(vfp, (0, 0, 0, vsp - vfp.shape[0]))
-            ctx = ttnn.matmul(rep(vfp, d), w["d.fc"])
+            ctx = ttnn.matmul(rep(vfp, d), w["d.fc"])  # Linear: re-project context
             ctx = dev_norm(ctx, w["d.hn_w"], vsp, w, d)
 
         el = time.time() - ts
