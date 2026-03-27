@@ -81,6 +81,8 @@ def load_target_weights(d):
     sin_adj[:, :HDIM // 2] = -sin_adj[:, :HDIM // 2]
     w["rope_cos_full"] = rep(cos_full, d)
     w["rope_sin_adj"] = rep(sin_adj, d)
+    w["rope_cos_full_host"] = cos_full
+    w["rope_sin_adj_host"] = sin_adj
 
     for li in range(TLAYERS):
         p = f"model.layers.{li}"
@@ -284,6 +286,33 @@ def target_fwd(h, w, sp, d, s):
     fn = dev_norm(h, "final_norm_tt", w, s["norm"])
     ttnn.matmul(fn, w["lm_head"], optional_output_tensor=s["logits"])
     return s["logits"]
+
+
+def target_fwd_save_hs(h, w, sp, d, s, save_layers):
+    """Like target_fwd but saves hidden states at specified layer indices.
+
+    Returns (logits, {layer_id: device_tensor}).
+    Hidden states stay on device -- they feed directly into draft context projection.
+    Each saved tensor is a copy (since s["add"] gets reused across layers).
+    """
+    hs = {}
+    for li in range(TLAYERS):
+        lp = f"t.{li}"
+
+        n = dev_norm(h, f"{lp}.in_w_tt", w, s["norm"])
+        attn_out = dev_attn(n, w, lp, sp, s)
+        h = dev_add(h, attn_out, s["add"])
+
+        nm = dev_norm(h, f"{lp}.pa_w_tt", w, s["norm"])
+        moe_out = dev_moe(nm, w, lp, s)
+        h = dev_add(h, moe_out, s["add"])
+
+        if li in save_layers:
+            hs[li] = ttnn.clone(h)
+
+    fn = dev_norm(h, "final_norm_tt", w, s["norm"])
+    ttnn.matmul(fn, w["lm_head"], optional_output_tensor=s["logits"])
+    return s["logits"], hs
 
 
 def target_fwd_profiled(h, w, sp, d, s):
