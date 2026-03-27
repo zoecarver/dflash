@@ -133,7 +133,9 @@ def load_weights(d):
     print("  embed/lm_head...")
     w["embed_h"] = gt("model.embed_tokens.weight").to(torch.bfloat16)
     w["lm_head"] = shd(gt("lm_head.weight").T.contiguous().to(torch.bfloat16), d, dim=1)
-    w["final_norm"] = gt("model.norm.weight").to(torch.bfloat16)
+    fn_w = gt("model.norm.weight").to(torch.bfloat16)
+    w["final_norm"] = fn_w  # host tensor for draft model
+    w["final_norm_tt"] = rep(fn_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
 
     w["sc"] = rep(torch.ones(TILE, TILE, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
     w["ms"] = rep(torch.full((TILE, TILE), 1.0 / HIDDEN, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
@@ -163,8 +165,13 @@ def load_weights(d):
         p = f"model.layers.{li}"
         lp = f"t.{li}"
 
-        w[f"{lp}.in_w"] = gt(f"{p}.input_layernorm.weight").to(torch.bfloat16)
-        w[f"{lp}.pa_w"] = gt(f"{p}.post_attention_layernorm.weight").to(torch.bfloat16)
+        in_w = gt(f"{p}.input_layernorm.weight").to(torch.bfloat16)
+        pa_w = gt(f"{p}.post_attention_layernorm.weight").to(torch.bfloat16)
+        w[f"{lp}.in_w"] = in_w  # host tensor for draft model
+        w[f"{lp}.pa_w"] = pa_w
+        # Precomputed TILE-expanded norm weights for device (eliminates rep() in hot loop)
+        w[f"{lp}.in_w_tt"] = rep(in_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        w[f"{lp}.pa_w_tt"] = rep(pa_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
 
         # Combined QKV + swap: [Q|K|V|Q_swap|K_swap] column-parallel
         qw = gt(f"{p}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16)
@@ -189,6 +196,9 @@ def load_weights(d):
         # Device tensors for TT-Lang per-head rmsnorm kernel (unused, see PCC note above)
         w[f"{lp}.qnw_tt"] = rep(qnw_raw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
         w[f"{lp}.knw_tt"] = rep(knw_raw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        # Device tensors for ttnn.rms_norm (1, HDIM) -- used in hot loop
+        w[f"{lp}.qnw_dev"] = rep(qnw_raw.unsqueeze(0).contiguous(), d)
+        w[f"{lp}.knw_dev"] = rep(knw_raw.unsqueeze(0).contiguous(), d)
 
         # Router: replicated
         w[f"{lp}.rw"] = rep(gt(f"{p}.mlp.gate.weight").T.contiguous().to(torch.bfloat16), d)
@@ -218,14 +228,22 @@ def load_weights(d):
     print("  draft weights...")
     with safe_open(f"{DRAFT_DIR}/model.safetensors", framework="pt") as f:
         w["d.fc"] = rep(f.get_tensor("fc.weight").T.contiguous().to(torch.bfloat16), d)
-        w["d.hn_w"] = f.get_tensor("hidden_norm.weight").to(torch.bfloat16)
-        w["d.fn_w"] = f.get_tensor("norm.weight").to(torch.bfloat16)
+        hn_w = f.get_tensor("hidden_norm.weight").to(torch.bfloat16)
+        fn_w = f.get_tensor("norm.weight").to(torch.bfloat16)
+        w["d.hn_w"] = hn_w
+        w["d.fn_w"] = fn_w
+        w["d.hn_w_tt"] = rep(hn_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        w["d.fn_w_tt"] = rep(fn_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
 
         for li in range(DLAYERS):
             dp = f"layers.{li}"
             lp = f"d.{li}"
-            w[f"{lp}.in_w"] = f.get_tensor(f"{dp}.input_layernorm.weight").to(torch.bfloat16)
-            w[f"{lp}.pa_w"] = f.get_tensor(f"{dp}.post_attention_layernorm.weight").to(torch.bfloat16)
+            din_w = f.get_tensor(f"{dp}.input_layernorm.weight").to(torch.bfloat16)
+            dpa_w = f.get_tensor(f"{dp}.post_attention_layernorm.weight").to(torch.bfloat16)
+            w[f"{lp}.in_w"] = din_w
+            w[f"{lp}.pa_w"] = dpa_w
+            w[f"{lp}.in_w_tt"] = rep(din_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+            w[f"{lp}.pa_w_tt"] = rep(dpa_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
 
             dqw = f.get_tensor(f"{dp}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16)
             dkw = f.get_tensor(f"{dp}.self_attn.k_proj.weight").T.contiguous().to(torch.bfloat16)
@@ -254,16 +272,15 @@ def load_weights(d):
 # ---------------------------------------------------------------------------
 # On-device building blocks
 # ---------------------------------------------------------------------------
-def dev_norm(x, nw, sp, w, d):
-    we = nw.unsqueeze(0).expand(TILE, -1).contiguous().to(torch.bfloat16)
-    weight_tt = rep(we, d)
-    out = ztt((sp, HIDDEN), d)
-    rmsnorm_k(x, weight_tt, w["sc"], w["ms"], out)
+def dev_norm(x, nw_key, w):
+    """RMSNorm on device. nw_key is key into w for precomputed device weight."""
+    out = ttnn.zeros_like(x)
+    rmsnorm_k(x, w[nw_key], w["sc"], w["ms"], out)
     return out
 
 
-def dev_add(a, b, sp, d):
-    out = ztt((sp, HIDDEN), d)
+def dev_add(a, b):
+    out = ttnn.zeros_like(a)
     residual_add_kernel(a, b, out)
     return out
 
@@ -284,10 +301,8 @@ def dev_attn(normed, w, lp, sl, sp, d):
     # Reshape (sp, heads*HDIM) -> (sp*heads, HDIM) so each row is one head
     q_flat = ttnn.reshape(q, (sp * NQH_TP, HDIM))
     k_flat = ttnn.reshape(k, (sp * NKVH_TP, HDIM))
-    qnw_tt = rep(w[f"{lp}.qnw"].unsqueeze(0).contiguous(), d)
-    knw_tt = rep(w[f"{lp}.knw"].unsqueeze(0).contiguous(), d)
-    q_normed_flat = ttnn.rms_norm(q_flat, weight=qnw_tt, epsilon=EPS)
-    k_normed_flat = ttnn.rms_norm(k_flat, weight=knw_tt, epsilon=EPS)
+    q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"{lp}.qnw_dev"], epsilon=EPS)
+    k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"{lp}.knw_dev"], epsilon=EPS)
     q_normed = ttnn.reshape(q_normed_flat, (sp, NQH_TP * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (sp, NKVH_TP * HDIM))
 
@@ -365,20 +380,22 @@ def dev_moe(h, w, lp, sl, sp, d):
     routing_mask = torch.zeros_like(sh)
     routing_mask.scatter_(1, topk_idx, topk_vals)
 
-    act_all = ttnn.to_torch(act, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=0))
-
-    weighted_parts = []
+    # Expand routing weights per chip and upload sharded
+    # Each expert's scalar weight broadcast across MOE_INTER=768 columns
+    expanded_parts = []
     for c in range(N_CHIPS):
-        chip_act = act_all[c * sp:(c + 1) * sp][:sl].float()
         cs = routing_mask[:, c * EPC:(c + 1) * EPC]
         cs_exp = cs.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
-        weighted_parts.append((chip_act * cs_exp).to(torch.bfloat16))
+        expanded_parts.append(cs_exp.to(torch.bfloat16))
+    all_expanded = torch.cat(expanded_parts, dim=1)
+    ep = _p(all_expanded)
+    if ep.shape[0] < sp:
+        ep = F.pad(ep, (0, 0, 0, sp - ep.shape[0]))
+    routing_tt = shd(ep, d, dim=1)
 
-    all_weighted = torch.cat(weighted_parts, dim=1)
-    wp = _p(all_weighted)
-    if wp.shape[0] < sp:
-        wp = F.pad(wp, (0, 0, 0, sp - wp.shape[0]))
-    weighted = shd(wp, d, dim=1)
+    # Device: apply routing weights (eliminates activation readback)
+    # TODO: silu_mul_weight_kernel would fuse this into one kernel but has PCC issues on large tensors
+    weighted = ttnn.multiply(act, routing_tt)
 
     # Linear: down projection (row-parallel) + collective all_reduce
     out = ttnn.matmul(weighted, w[f"{lp}.down_all"])
@@ -396,18 +413,18 @@ def target_fwd(h, w, sl, sp, d, save_hs=False):
         if save_hs and li in TLAYER_IDS:
             hs[li] = rb(h)[:sl, :HIDDEN].to(torch.bfloat16)
 
-        n = dev_norm(h, w[f"{lp}.in_w"], sp, w, d)
+        n = dev_norm(h, f"{lp}.in_w_tt", w)
         attn_out = dev_attn(n, w, lp, sl, sp, d)
-        h = dev_add(h, attn_out, sp, d)
+        h = dev_add(h, attn_out)
 
-        nm = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
+        nm = dev_norm(h, f"{lp}.pa_w_tt", w)
         moe_out = dev_moe(nm, w, lp, sl, sp, d)
-        h = dev_add(h, moe_out, sp, d)
+        h = dev_add(h, moe_out)
 
         if (li + 1) % 8 == 0:
             print(f"    layer {li+1}/{TLAYERS}")
 
-    fn = dev_norm(h, w["final_norm"], sp, w, d)
+    fn = dev_norm(h, "final_norm_tt", w)
     logits = ttnn.matmul(fn, w["lm_head"])  # Linear: lm_head projection
     return logits, hs
 
@@ -420,7 +437,7 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
     h = noise
     for li in range(DLAYERS):
         lp = f"d.{li}"
-        n = dev_norm(h, w[f"{lp}.in_w"], sp, w, d)
+        n = dev_norm(h, f"{lp}.in_w_tt", w)
 
         # Linear: cross-attention Q from draft, K/V from [ctx, draft]
         q = ttnn.matmul(n, w[f"{lp}.qw"])
@@ -481,21 +498,21 @@ def draft_fwd(noise, ctx, w, sl, ctx_len, sp, d):
         # Linear: O projection (row-parallel) + collective all_reduce
         o = ttnn.matmul(shd(ap, d, dim=1), w[f"{lp}.ow"])
         o = ttnn.all_reduce(o)
-        h = dev_add(h, o, sp, d)
+        h = dev_add(h, o)
 
         # Dense MLP
-        n2 = dev_norm(h, w[f"{lp}.pa_w"], sp, w, d)
+        n2 = dev_norm(h, f"{lp}.pa_w_tt", w)
         gate = ttnn.matmul(n2, w[f"{lp}.gw"])  # Linear: gate (column-parallel)
         up = ttnn.matmul(n2, w[f"{lp}.uw"])     # Linear: up (column-parallel)
         # TT-Lang: fused silu(gate) * up (avoids host readback)
-        activated = shd(torch.zeros(sp, DINTER, dtype=torch.bfloat16), d, dim=1)
+        activated = ttnn.zeros_like(gate)
         silu_mul_kernel(gate, up, activated)
         # Linear: down projection (row-parallel) + collective all_reduce
         fc2 = ttnn.matmul(activated, w[f"{lp}.fc2"])
         fc2 = ttnn.all_reduce(fc2)
-        h = dev_add(h, fc2, sp, d)
+        h = dev_add(h, fc2)
 
-    h = dev_norm(h, w["d.fn_w"], sp, w, d)
+    h = dev_norm(h, "d.fn_w_tt", w)
     return h
 
 
@@ -532,7 +549,7 @@ def spec_generate(ids, w, d, max_new=64):
     if tf_p.shape[0] < tf_sp:
         tf_p = F.pad(tf_p, (0, 0, 0, tf_sp - tf_p.shape[0]))
     ctx = ttnn.matmul(rep(tf_p, d), w["d.fc"])  # Linear: project target hidden states
-    ctx = dev_norm(ctx, w["d.hn_w"], tf_sp, w, d)
+    ctx = dev_norm(ctx, "d.hn_w_tt", w)
 
     start = pl
     gen = 0
@@ -579,7 +596,7 @@ def spec_generate(ids, w, d, max_new=64):
             if vfp.shape[0] < vsp:
                 vfp = F.pad(vfp, (0, 0, 0, vsp - vfp.shape[0]))
             ctx = ttnn.matmul(rep(vfp, d), w["d.fc"])  # Linear: re-project context
-            ctx = dev_norm(ctx, w["d.hn_w"], vsp, w, d)
+            ctx = dev_norm(ctx, "d.hn_w_tt", w)
 
         el = time.time() - ts
         avg = sum(ahist) / len(ahist)
