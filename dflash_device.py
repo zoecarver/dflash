@@ -17,6 +17,7 @@ from safetensors import safe_open
 from rmsnorm import make_rmsnorm_kernel
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
+from silu_mul_weight import silu_mul_weight_kernel
 from rope_qknorm import make_rope_qknorm_kernel
 
 TILE = 32
@@ -335,39 +336,34 @@ def dev_moe(h, w, lp, sl, sp, d):
     gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
     up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
 
-    # SiLU(gate) * up (TT-Lang fused kernel)
-    total_cols = N_CHIPS * local_dim
-    act = shd(torch.zeros(sp, total_cols, dtype=torch.bfloat16), d, dim=1)
-    silu_mul_kernel(gate, up, act)
-
-    # Read back activations and scores for per-chip weighted sum on host.
-    # (Batched device multiply is broken due to rep/sharded mismatch -- P2 fix)
+    # Host: topk routing (requires conditional logic not available in TT-Lang)
     sh = rb(scores)[:sl, :NEXPERTS].float()
     topk_vals, topk_idx = torch.topk(sh, TOPK, dim=-1)
     topk_vals = topk_vals / topk_vals.sum(-1, keepdim=True)
     routing_mask = torch.zeros_like(sh)
     routing_mask.scatter_(1, topk_idx, topk_vals)
 
-    # Read all chips' activations: dim=0 concat gives (4*sp, local_dim)
-    act_all = ttnn.to_torch(act, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=0))
-
-    # Apply routing weights per chip, build weighted sum for down proj
-    weighted_parts = []
+    # Expand routing weights per chip: (sl, 32) -> (sl, 24576) per chip
+    # Each expert's scalar weight is broadcast across MOE_INTER=768 columns
+    expanded_parts = []
     for c in range(N_CHIPS):
-        chip_act = act_all[c * sp:(c + 1) * sp][:sl].float()  # (sl, 24576)
-        cs = routing_mask[:, c * EPC:(c + 1) * EPC]  # (sl, 32)
+        cs = routing_mask[:, c * EPC:(c + 1) * EPC]
         cs_exp = cs.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
-        weighted_parts.append((chip_act * cs_exp).to(torch.bfloat16))
+        expanded_parts.append(cs_exp.to(torch.bfloat16))
+    all_expanded = torch.cat(expanded_parts, dim=1)
+    ep = _p(all_expanded)
+    if ep.shape[0] < sp:
+        ep = F.pad(ep, (0, 0, 0, sp - ep.shape[0]))
+    routing_tt = shd(ep, d, dim=1)
 
-    # Each chip needs its own weighted activation for row-parallel down proj
-    all_weighted = torch.cat(weighted_parts, dim=1)  # (sl, 4*24576=98304)
-    wp = _p(all_weighted)
-    if wp.shape[0] < sp:
-        wp = F.pad(wp, (0, 0, 0, sp - wp.shape[0]))
-    weighted_tt = shd(wp, d, dim=1)  # each chip gets (sp, 24576)
+    # Fused silu(gate) * up * routing_weight (TT-Lang kernel)
+    # Eliminates device->host readback of activations
+    total_cols = N_CHIPS * local_dim
+    weighted = shd(torch.zeros(sp, total_cols, dtype=torch.bfloat16), d, dim=1)
+    silu_mul_weight_kernel(gate, up, routing_tt, weighted)
 
     # Down projection (row-parallel) + all_reduce
-    out = ttnn.matmul(weighted_tt, w[f"{lp}.down_all"])
+    out = ttnn.matmul(weighted, w[f"{lp}.down_all"])
     out = ttnn.all_reduce(out)
     return out
 
