@@ -17,8 +17,8 @@ from safetensors import safe_open
 from rmsnorm import make_rmsnorm_kernel
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
-from silu_mul_weight import silu_mul_weight_kernel
-from rope_qknorm import make_rope_qknorm_kernel
+from per_head_rmsnorm import make_per_head_rmsnorm_kernel
+from rope import make_rope_kernel
 
 TILE = 32
 HIDDEN = 2048
@@ -54,6 +54,12 @@ TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
 DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
 
 rmsnorm_k = make_rmsnorm_kernel(dim_tiles=HTILES, eps=EPS)
+# Per-head RMSNorm kernels: PCC ~0.915 on mesh (vs >0.9999 in unit test on single device).
+# Using ttnn.reshape + ttnn.rms_norm instead for now. Investigate bf16 reduction accuracy.
+q_head_norm_k = make_per_head_rmsnorm_kernel(head_tiles=HDIM_TILES, n_heads=NQH_TP, eps=EPS)
+k_head_norm_k = make_per_head_rmsnorm_kernel(head_tiles=HDIM_TILES, n_heads=NKVH_TP, eps=EPS)
+q_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NQH_TP)
+k_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NKVH_TP)
 _MESH = None
 
 
@@ -132,15 +138,26 @@ def load_weights(d):
     w["sc"] = rep(torch.ones(TILE, TILE, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
     w["ms"] = rep(torch.full((TILE, TILE), 1.0 / HIDDEN, dtype=torch.bfloat16), d, mem=ttnn.L1_MEMORY_CONFIG)
 
-    # RoPE tables (replicated, L1)
+    # Per-head norm support for TT-Lang q_head_norm_k/k_head_norm_k (unused, see PCC note above)
+    w["ms_head"] = rep(torch.full((TILE, TILE), 1.0 / HDIM, dtype=torch.bfloat16), d)
+
+    # RoPE tables (replicated)
     max_seq = 4096
     freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
     pos = torch.arange(max_seq, dtype=torch.float32)
     angles = torch.outer(pos, freqs)
     cos_t = torch.cos(angles).to(torch.bfloat16)  # (max_seq, HDIM/2)
     sin_t = torch.sin(angles).to(torch.bfloat16)
+    # Half-width tables for host fallback (draft model)
     w["rope_cos"] = rep(cos_t, d)
     w["rope_sin"] = rep(sin_t, d)
+    # Full-width tables for device RoPE kernel
+    cos_full = cos_t.repeat(1, 2)[:, :HDIM]  # (max_seq, HDIM)
+    sin_full = sin_t.repeat(1, 2)[:, :HDIM]
+    sin_adj = sin_full.clone()
+    sin_adj[:, :HDIM // 2] = -sin_adj[:, :HDIM // 2]
+    w["rope_cos_full"] = rep(cos_full, d)
+    w["rope_sin_adj"] = rep(sin_adj, d)
 
     for li in range(TLAYERS):
         p = f"model.layers.{li}"
@@ -165,8 +182,13 @@ def load_weights(d):
         ow = gt(f"{p}.self_attn.o_proj.weight").T.contiguous().to(torch.bfloat16)
         w[f"{lp}.ow"] = shd(ow, d, dim=0)
 
-        w[f"{lp}.qnw"] = gt(f"{p}.self_attn.q_norm.weight").to(torch.bfloat16)
-        w[f"{lp}.knw"] = gt(f"{p}.self_attn.k_norm.weight").to(torch.bfloat16)
+        qnw_raw = gt(f"{p}.self_attn.q_norm.weight").to(torch.bfloat16)
+        knw_raw = gt(f"{p}.self_attn.k_norm.weight").to(torch.bfloat16)
+        w[f"{lp}.qnw"] = qnw_raw  # host tensor for draft model
+        w[f"{lp}.knw"] = knw_raw
+        # Device tensors for TT-Lang per-head rmsnorm kernel (unused, see PCC note above)
+        w[f"{lp}.qnw_tt"] = rep(qnw_raw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        w[f"{lp}.knw_tt"] = rep(knw_raw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
 
         # Router: replicated
         w[f"{lp}.rw"] = rep(gt(f"{p}.mlp.gate.weight").T.contiguous().to(torch.bfloat16), d)
@@ -233,7 +255,6 @@ def load_weights(d):
 # On-device building blocks
 # ---------------------------------------------------------------------------
 def dev_norm(x, nw, sp, w, d):
-    # TT-Lang rmsnorm: expand weight to TILE rows so all rows in a tile see values
     we = nw.unsqueeze(0).expand(TILE, -1).contiguous().to(torch.bfloat16)
     weight_tt = rep(we, d)
     out = ztt((sp, HIDDEN), d)
@@ -253,50 +274,40 @@ def rb_dim1(t):
 
 
 def dev_attn(normed, w, lp, sl, sp, d):
-    """GQA attention. QKV on device (column-parallel), QK-norm + RoPE on host."""
+    """GQA attention. QKV on device, QK-norm + RoPE on device via TT-Lang."""
     # Linear: QKV projections (column-parallel, each chip has its heads)
     q = ttnn.matmul(normed, w[f"{lp}.qw"])     # (sp, Q_TP=1024) per chip
     k = ttnn.matmul(normed, w[f"{lp}.kw"])     # (sp, KV_TP=128) per chip
     v = ttnn.matmul(normed, w[f"{lp}.vw"])     # (sp, KV_TP=128) per chip
 
-    # Host: gather all heads for QK-norm + RoPE.
-    # These stay on host because QK-norm uses per-head RMSNorm (same reduce+broadcast
-    # pattern as the buggy TT-Lang rmsnorm) and RoPE needs rotate_half which requires
-    # cross-tile data shuffling not yet supported in TT-Lang.
-    qh = rb_dim1(q)[:sl].float()    # (sl, NQH*HDIM=4096) all 32 Q heads
-    kh = rb_dim1(k)[:sl].float()    # (sl, NKVH*HDIM=512) all 4 KV heads
-    vh = rb_dim1(v)[:sl].float()    # (sl, NKVH*HDIM=512)
+    # Device: per-head RMSNorm via reshape + ttnn.rms_norm
+    # Reshape (sp, heads*HDIM) -> (sp*heads, HDIM) so each row is one head
+    q_flat = ttnn.reshape(q, (sp * NQH_TP, HDIM))
+    k_flat = ttnn.reshape(k, (sp * NKVH_TP, HDIM))
+    qnw_tt = rep(w[f"{lp}.qnw"].unsqueeze(0).contiguous(), d)
+    knw_tt = rep(w[f"{lp}.knw"].unsqueeze(0).contiguous(), d)
+    q_normed_flat = ttnn.rms_norm(q_flat, weight=qnw_tt, epsilon=EPS)
+    k_normed_flat = ttnn.rms_norm(k_flat, weight=knw_tt, epsilon=EPS)
+    q_normed = ttnn.reshape(q_normed_flat, (sp, NQH_TP * HDIM))
+    k_normed = ttnn.reshape(k_normed_flat, (sp, NKVH_TP * HDIM))
 
-    # QK-norm: per-head RMSNorm before RoPE
-    qnw = w[f"{lp}.qnw"].float()
-    knw = w[f"{lp}.knw"].float()
+    # Device: RoPE on normed Q and K
+    cos_sp = w["rope_cos_full"]
+    sin_sp = w["rope_sin_adj"]
+    q_roped = ttnn.zeros_like(q)
+    k_roped = ttnn.zeros_like(k)
+    q_rope_k(q_normed, cos_sp, sin_sp, q_roped)
+    k_rope_k(k_normed, cos_sp, sin_sp, k_roped)
 
-    def head_rms_norm(x, nw, n_heads):
-        x4 = x.view(-1, n_heads, HDIM)
-        rms = torch.sqrt(x4.pow(2).mean(dim=-1, keepdim=True) + EPS)
-        return ((x4 / rms) * nw).view(x.shape)
-
-    qh = head_rms_norm(qh, qnw, NQH)
-    kh = head_rms_norm(kh, knw, NKVH)
-
-    # RoPE: standard rotate_half formulation
-    def rotate_half_flat(x, n_heads):
-        x4 = x.view(-1, n_heads, HDIM)
-        x1, x2 = x4[..., :HDIM // 2], x4[..., HDIM // 2:]
-        return torch.cat((-x2, x1), dim=-1).view(x.shape)
-
-    cos_h = rb(w["rope_cos"])[:sl].float()  # (sl, HDIM/2=64)
-    sin_h = rb(w["rope_sin"])[:sl].float()
-    cos_full = cos_h.repeat(1, 2)[:, :HDIM]
-    sin_full = sin_h.repeat(1, 2)[:, :HDIM]
-
-    q_roped = qh * cos_full.repeat(1, NQH) + rotate_half_flat(qh, NQH) * sin_full.repeat(1, NQH)
-    k_roped = kh * cos_full.repeat(1, NKVH) + rotate_half_flat(kh, NKVH) * sin_full.repeat(1, NKVH)
+    # Host: readback for SDPA reshape
+    qh = rb_dim1(q_roped)[:sl].to(torch.bfloat16)
+    kh = rb_dim1(k_roped)[:sl].to(torch.bfloat16)
+    vh = rb_dim1(v)[:sl].to(torch.bfloat16)
 
     # Reshape for SDPA: (1, heads, sl, HDIM)
-    q4 = q_roped.view(1, sl, NQH, HDIM).transpose(1, 2).to(torch.bfloat16)
-    k4 = k_roped.view(1, sl, NKVH, HDIM).transpose(1, 2).to(torch.bfloat16)
-    v4 = vh.view(1, sl, NKVH, HDIM).transpose(1, 2).to(torch.bfloat16)
+    q4 = qh.view(1, sl, NQH, HDIM).transpose(1, 2)
+    k4 = kh.view(1, sl, NKVH, HDIM).transpose(1, 2)
+    v4 = vh.view(1, sl, NKVH, HDIM).transpose(1, 2)
 
     # GQA: expand K/V to match Q head count (interleave, not tile)
     k4 = k4.repeat_interleave(GQA, dim=1)
@@ -344,6 +355,9 @@ def dev_moe(h, w, lp, sl, sp, d):
     gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
     up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
 
+    # SiLU(gate) * up on device
+    act = ttnn.multiply(ttnn.silu(gate), up)
+
     # Host: topk routing (requires conditional logic not available in TT-Lang)
     sh = rb(scores)[:sl, :NEXPERTS].float()
     topk_vals, topk_idx = torch.topk(sh, TOPK, dim=-1)
@@ -351,24 +365,20 @@ def dev_moe(h, w, lp, sl, sp, d):
     routing_mask = torch.zeros_like(sh)
     routing_mask.scatter_(1, topk_idx, topk_vals)
 
-    # Expand routing weights per chip: (sl, 32) -> (sl, 24576) per chip
-    # Each expert's scalar weight is broadcast across MOE_INTER=768 columns
-    expanded_parts = []
+    act_all = ttnn.to_torch(act, mesh_composer=ttnn.ConcatMeshToTensor(_MESH, dim=0))
+
+    weighted_parts = []
     for c in range(N_CHIPS):
+        chip_act = act_all[c * sp:(c + 1) * sp][:sl].float()
         cs = routing_mask[:, c * EPC:(c + 1) * EPC]
         cs_exp = cs.unsqueeze(-1).expand(-1, -1, MOE_INTER).reshape(sl, local_dim)
-        expanded_parts.append(cs_exp.to(torch.bfloat16))
-    all_expanded = torch.cat(expanded_parts, dim=1)
-    ep = _p(all_expanded)
-    if ep.shape[0] < sp:
-        ep = F.pad(ep, (0, 0, 0, sp - ep.shape[0]))
-    routing_tt = shd(ep, d, dim=1)
+        weighted_parts.append((chip_act * cs_exp).to(torch.bfloat16))
 
-    # Fused silu(gate) * up * routing_weight (TT-Lang kernel)
-    # Eliminates device->host readback of activations
-    total_cols = N_CHIPS * local_dim
-    weighted = shd(torch.zeros(sp, total_cols, dtype=torch.bfloat16), d, dim=1)
-    silu_mul_weight_kernel(gate, up, routing_tt, weighted)
+    all_weighted = torch.cat(weighted_parts, dim=1)
+    wp = _p(all_weighted)
+    if wp.shape[0] < sp:
+        wp = F.pad(wp, (0, 0, 0, sp - wp.shape[0]))
+    weighted = shd(wp, d, dim=1)
 
     # Linear: down projection (row-parallel) + collective all_reduce
     out = ttnn.matmul(weighted, w[f"{lp}.down_all"])
