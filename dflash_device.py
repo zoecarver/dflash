@@ -237,7 +237,9 @@ def dev_norm(x, nw, sp, w, d):
 
 
 def dev_add(a, b, sp, d):
-    return ttnn.add(a, b)
+    out = ztt((sp, HIDDEN), d)
+    residual_add_kernel(a, b, out)
+    return out
 
 
 def rb_dim1(t):
