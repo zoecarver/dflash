@@ -10,15 +10,15 @@ HIDDEN = 2048
 
 
 def main():
-    from dflash_device import (load_weights, open_dev, close_dev,
-                                rep, rb_dim1, _p,
-                                prealloc_target_scratch,
-                                capture_target_trace,
-                                execute_target_trace)
+    from device import open_dev, close_dev, _p, rb_dim1
+    from qwen3 import (load_target_weights,
+                        prealloc_target_scratch,
+                        capture_target_trace,
+                        execute_target_trace)
 
     d = open_dev()
     try:
-        w = load_weights(d)
+        w = load_target_weights(d)
 
         try:
             from transformers import AutoTokenizer
