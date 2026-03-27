@@ -335,8 +335,10 @@ def dev_moe(h, w, lp, sl, sp, d):
     gate = ttnn.matmul(h, w[f"{lp}.gate_all"])   # (sp, 24576) per chip
     up = ttnn.matmul(h, w[f"{lp}.up_all"])       # (sp, 24576) per chip
 
-    # SiLU(gate) * up
-    act = ttnn.multiply(ttnn.silu(gate), up)
+    # SiLU(gate) * up (TT-Lang fused kernel)
+    total_cols = N_CHIPS * local_dim
+    act = shd(torch.zeros(sp, total_cols, dtype=torch.bfloat16), d, dim=1)
+    silu_mul_kernel(gate, up, act)
 
     # Read back activations and scores for per-chip weighted sum on host.
     # (Batched device multiply is broken due to rep/sharded mismatch -- P2 fix)
