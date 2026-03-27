@@ -291,34 +291,33 @@ def prealloc_scratch(sp, d):
     """
     L1 = ttnn.L1_MEMORY_CONFIG
     s = {}
-    # Helpers -- L1 for small/hot, DRAM for large
-    def _rep_h_l1(): return rep(torch.zeros(sp, HIDDEN, dtype=torch.bfloat16), d, mem=L1)
-    def _shd_q_l1(): return shd(torch.zeros(sp, Q_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1, mem=L1)
-    def _shd_kv_l1(): return shd(torch.zeros(sp, KV_TP * N_CHIPS, dtype=torch.bfloat16), d, dim=1, mem=L1)
-    def _shd_moe(): return shd(torch.zeros(sp, EPC * MOE_INTER * N_CHIPS, dtype=torch.bfloat16), d, dim=1)
+    # All scratch in L1 interleaved (~800MB available across all cores)
+    def _rep(shape): return rep(torch.zeros(*shape, dtype=torch.bfloat16), d, mem=L1)
+    def _shd(shape, dim): return shd(torch.zeros(*shape, dtype=torch.bfloat16), d, dim=dim, mem=L1)
 
-    # Norm + add outputs: L1 (128KB each, read/written every layer)
-    s["norm"] = _rep_h_l1()
-    s["add"] = _rep_h_l1()
-    # Attention scratch: Q/K/V and RoPE outputs in L1
-    s["q"] = _shd_q_l1()       # (sp, 1024) per chip = 64KB
-    s["k"] = _shd_kv_l1()      # (sp, 128) per chip = 8KB
-    s["v"] = _shd_kv_l1()      # (sp, 128) per chip = 8KB
-    s["q_rope"] = _shd_q_l1()  # 64KB
-    s["k_rope"] = _shd_kv_l1() # 8KB
-    s["o"] = _rep_h_l1()       # 128KB
-    # MoE scratch: router in L1 (8KB), activations in DRAM (1.5MB each)
-    s["router"] = rep(torch.zeros(sp, NEXPERTS, dtype=torch.bfloat16), d, mem=L1)
-    s["gate"] = _shd_moe()
-    s["up"] = _shd_moe()
-    s["silu"] = _shd_moe()
-    s["act"] = _shd_moe()
-    s["weighted"] = _shd_moe()
-    s["moe_out"] = _rep_h_l1()  # 128KB
-    s["routing_tt"] = _shd_moe()
-    s["down"] = _rep_h_l1()     # 128KB
-    # Final: logits in DRAM (large)
-    s["logits"] = shd(torch.zeros(sp, VOCAB, dtype=torch.bfloat16), d, dim=1)
+    # Norm + add outputs
+    s["norm"] = _rep((sp, HIDDEN))
+    s["add"] = _rep((sp, HIDDEN))
+    # Attention scratch
+    s["q"] = _shd((sp, Q_TP * N_CHIPS), dim=1)
+    s["k"] = _shd((sp, KV_TP * N_CHIPS), dim=1)
+    s["v"] = _shd((sp, KV_TP * N_CHIPS), dim=1)
+    s["q_rope"] = _shd((sp, Q_TP * N_CHIPS), dim=1)
+    s["k_rope"] = _shd((sp, KV_TP * N_CHIPS), dim=1)
+    s["o"] = _rep((sp, HIDDEN))
+    # MoE scratch
+    moe_cols = EPC * MOE_INTER * N_CHIPS
+    s["router"] = _rep((sp, NEXPERTS))
+    s["gate"] = _shd((sp, moe_cols), dim=1)
+    s["up"] = _shd((sp, moe_cols), dim=1)
+    s["silu"] = _shd((sp, moe_cols), dim=1)
+    s["act"] = _shd((sp, moe_cols), dim=1)
+    s["weighted"] = _shd((sp, moe_cols), dim=1)
+    s["moe_out"] = _rep((sp, HIDDEN))
+    s["routing_tt"] = _shd((sp, moe_cols), dim=1)
+    s["down"] = _rep((sp, HIDDEN))
+    # Final
+    s["logits"] = _shd((sp, VOCAB), dim=1)
     return s
 
 
@@ -431,6 +430,37 @@ def target_fwd(h, w, sp, d, s):
     return s["logits"]
 
 
+def target_fwd_profiled(h, w, sp, d, s):
+    """Profiled version of target_fwd -- syncs after each op to measure time."""
+    from collections import defaultdict
+    timers = defaultdict(float)
+    def _t(name, fn):
+        ttnn.synchronize_device(d)
+        t0 = time.time()
+        result = fn()
+        ttnn.synchronize_device(d)
+        timers[name] += time.time() - t0
+        return result
+
+    for li in range(TLAYERS):
+        lp = f"t.{li}"
+        n = _t("norm", lambda: dev_norm(h, f"{lp}.in_w_tt", w, s["norm"]))
+        attn_out = _t("attn", lambda: dev_attn(n, w, lp, sp, s))
+        h = _t("add", lambda: dev_add(h, attn_out, s["add"]))
+        nm = _t("norm", lambda: dev_norm(h, f"{lp}.pa_w_tt", w, s["norm"]))
+        moe_out = _t("moe", lambda: dev_moe(nm, w, lp, s))
+        h = _t("add", lambda: dev_add(h, moe_out, s["add"]))
+
+    fn = _t("norm", lambda: dev_norm(h, "final_norm_tt", w, s["norm"]))
+    _t("lm_head", lambda: ttnn.matmul(fn, w["lm_head"], optional_output_tensor=s["logits"]))
+
+    print("--- Per-op time (48 layers total) ---")
+    for name, elapsed in sorted(timers.items(), key=lambda x: -x[1]):
+        print(f"  {name:10s}: {elapsed:.3f}s")
+    print(f"  {'TOTAL':10s}: {sum(timers.values()):.3f}s")
+    return s["logits"]
+
+
 # ---------------------------------------------------------------------------
 # Tracing: preallocate -> compile -> capture -> replay
 # ---------------------------------------------------------------------------
@@ -450,11 +480,12 @@ def prealloc_target_scratch(sp, w, d):
     sin_adj_host = rb(w["rope_sin_adj"])[:sp].to(torch.bfloat16)
     w["rope_cos_sp"] = rep(cos_full_host, d, mem=ttnn.L1_MEMORY_CONFIG)
     w["rope_sin_sp"] = rep(sin_adj_host, d, mem=ttnn.L1_MEMORY_CONFIG)
-    # Compile pass (warmup)
+    # Compile pass (warmup) with per-op profiling
     print("Compiling target_fwd...")
     target_fwd(scr["h"], w, sp, d, scr)
     ttnn.synchronize_device(d)
-    print("Compilation done.")
+    print("Compilation done. Profiling second pass...")
+    target_fwd_profiled(scr["h"], w, sp, d, scr)
     return scr
 
 
