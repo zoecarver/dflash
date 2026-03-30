@@ -35,6 +35,12 @@ TLAYER_IDS = [1, 12, 23, 34, 45]
 MASK_ID = 151669
 DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
 
+# When True, use TT-Lang kernels for softmax, residual_add, silu_mul.
+# RoPE is always TT-Lang regardless of this flag.
+TTLANG_ENABLED = False
+# TT-Lang rmsnorm produces ~0.63x magnitude on 4-chip mesh (reduction bug).
+TTLANG_RMSNORM = False
+
 
 def _tile_pad(n):
     return ((n + TILE - 1) // TILE) * TILE
@@ -254,7 +260,7 @@ def prepare_context(target_hidden, w, d):
 # TTNN-only forward (for mesh devices where TT-Lang has scaling issues)
 # ---------------------------------------------------------------------------
 def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
-    """Single layer forward using TTNN ops only (no TT-Lang kernels)."""
+    """Single layer forward. Uses TT-Lang kernels when TTLANG_ENABLED."""
     scale = 1.0 / (HDIM ** 0.5)
     kv_sp = w["kv_sp"]
 
@@ -272,7 +278,7 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
 
-    # TT-Lang rope (element-wise, no reduction -- works on mesh)
+    # TT-Lang rope (always -- element-wise, works on mesh)
     q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
     k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
     q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
@@ -286,23 +292,51 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     scores = ttnn.matmul(q_grouped, k_t)
     scores = ttnn.multiply(scores, scale)
 
-    probs = ttnn.softmax(scores, dim=-1)
+    # Softmax: TT-Lang or TTNN
+    if TTLANG_ENABLED:
+        total_q_rows = NKVH * GQA * SP
+        scores_flat = ttnn.reshape(scores, (total_q_rows, kv_sp))
+        probs_flat = to_dev(torch.zeros(total_q_rows, kv_sp), d)
+        w["softmax_k"](scores_flat, w["sc"], probs_flat)
+        probs = ttnn.reshape(probs_flat, (1, NKVH, GQA * SP, kv_sp))
+    else:
+        probs = ttnn.softmax(scores, dim=-1)
 
     attn_4d = ttnn.matmul(probs, v4)
     attn_heads = ttnn.reshape(attn_4d, (1, NQH, SP, HDIM))
     attn_flat = ttnn.reshape(ttnn.transpose(attn_heads, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-    h = ttnn.add(h, o)
+
+    # Residual add: TT-Lang or TTNN
+    if TTLANG_ENABLED:
+        h_new = to_dev(torch.zeros(SP, HIDDEN), d)
+        residual_add_kernel(h, o, h_new)
+        h = h_new
+    else:
+        h = ttnn.add(h, o)
 
     normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
     gate = ttnn.matmul(normed2, w[f"gw.{li}"])
     up = ttnn.matmul(normed2, w[f"uw.{li}"])
-    act = ttnn.mul(ttnn.silu(gate), up)
+
+    # SiLU * mul: TT-Lang or TTNN
+    if TTLANG_ENABLED:
+        act = ttnn.zeros_like(gate)
+        silu_mul_kernel(gate, up, act)
+    else:
+        act = ttnn.mul(ttnn.silu(gate), up)
+
     down = ttnn.matmul(act, w[f"fc2.{li}"])
 
-    return ttnn.add(h, down)
+    # Residual add: TT-Lang or TTNN
+    if TTLANG_ENABLED:
+        h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
+        residual_add_kernel(h, down, h_new2)
+        return h_new2
+    else:
+        return ttnn.add(h, down)
 
 
 def draft_fwd_ttnn(noise, ctx, w, d):

@@ -15,6 +15,7 @@ from device import (
     _p, rep, rb, rb_dim1,
     open_dev, close_dev,
 )
+import dflash_draft
 from dflash_draft import (
     load_draft_weights, draft_fwd_ttnn, prepare_context_ttnn, setup_rope_tables,
     to_dev as draft_to_dev,
@@ -23,6 +24,10 @@ from dflash_draft import (
 )
 
 TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
+
+# Set True to use TT-Lang kernels for softmax, residual_add, silu_mul
+USE_TTLANG = True
+dflash_draft.TTLANG_ENABLED = USE_TTLANG
 
 
 def extract_context_feature(hidden_states, layer_ids):
