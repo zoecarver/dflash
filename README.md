@@ -8,70 +8,68 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
 
 ```
   ┌─────────────────────────────────────────────────────────────────────┐
-  │                      speculative decode loop                       │
-  │                                                                    │
-  │   target model (eg Qwen3-30B-A3B)                                 │
-  │   ┌─────────────────────────┐                                     │
-  │   │  48 layers, self-attn   │                                     │
-  │   │  + MoE                  │                                     │
-  │   │                         │                                     │
-  │   │  hidden states at       │                                     │
-  │   │  layers [1,12,23,34,45] │                                     │
-  │   └──────┬─────────────┬────┘                                     │
-  │          │             │                                          │
-  │          │ 5 x hidden  │ logits                                   │
-  │          │ states      │ (seq, vocab)                             │
-  │          ▼             ▼                                          │
-  │   ┌────────────┐  ┌──────────────────────────────┐               │
-  │   │ context    │  │ argmax target logits          │               │
-  │   │ projection │  │ compare with draft proposals: │               │
-  │   │ FC + norm  │  │   draft: [A, B, C, D, ...]   │               │
-  │   └─────┬──────┘  │   target: [A, B, X, ...]     │               │
-  │         │         │   accept prefix [A, B]        │               │
-  │         │ ctx     │   take target's token X       │               │
-  │         │         └──────────────┬────────────────┘               │
-  │         │                        │ accepted tokens                │
-  │         ▼                        │ fed back as next prompt        │
-  │   ┌─────────────────────────┐    │                                │
-  │   │    DFlash layer (x8)    │    │                                │
-  │   │                         │    │                                │
-  │   │  noise = embed(tokens)  │    │                                │
-  │   │  Q from noise           │    │                                │
-  │   │  K,V from [ctx; noise]  │    │                                │
-  │   │  QK-norm + RoPE         │    │                                │
-  │   │  SDPA (non-causal, GQA) │    │                                │
-  │   │  O proj + residual      │    │                                │
-  │   │  MLP + residual         │    │                                │
-  │   │  KV cache: ctx K,V      │    │                                │
-  │   └──────────┬──────────────┘    │                                │
-  │              ▼                   │                                │
-  │   RMSNorm → lm_head → argmax    │                                │
-  │              │                   │                                │
-  │              │ 16 draft tokens   │                                │
-  │              └───────────────────┘                                │
-  │              fed to target for verification                       │
+  │                      speculative decode loop                        │
+  │                                                                     │
+  │   target model (eg Qwen3-30B-A3B)                                   │
+  │   ┌─────────────────────────┐                                       │
+  │   │  48 layers, self-attn   │                                       │
+  │   │  + MoE                  │                                       │
+  │   │                         │                                       │
+  │   │  hidden states at       │                                       │
+  │   │  layers [1,12,23,34,45] │                                       │
+  │   └──────┬─────────────┬────┘                                       │
+  │          │             │                                            │
+  │          │ 5 x hidden  │ logits                                     │
+  │          │ states      │ (seq, vocab)                               │
+  │          ▼             ▼                                            │
+  │   ┌────────────┐  ┌───────────────────────────────┐                 │
+  │   │ context    │  │ argmax target logits          │                 │
+  │   │ projection │  │ compare with draft proposals: │                 │
+  │   │ FC + norm  │  │   draft: [A, B, C, D, ...]    │                 │
+  │   └─────┬──────┘  │   target: [A, B, X, ...]      │                 │
+  │         │         │   accept prefix [A, B]        │                 │
+  │         │ ctx     │   take target's token X       │                 │
+  │         │         └──────────────┬────────────────┘                 │
+  │         │                        │ accepted tokens                  │
+  │         ▼                        │ fed back as next prompt          │
+  │   ┌─────────────────────────┐    │                                  │
+  │   │    DFlash layer (x8)    │    │                                  │
+  │   │                         │    │                                  │
+  │   │  noise = embed(tokens)  │    │                                  │
+  │   │  Q from noise           │    │                                  │
+  │   │  K,V from [ctx; noise]  │    │                                  │
+  │   │  QK-norm + RoPE         │    │                                  │
+  │   │  SDPA (non-causal, GQA) │    │                                  │
+  │   │  O proj + residual      │    │                                  │
+  │   │  MLP + residual         │    │                                  │
+  │   │  KV cache: ctx K,V      │    │                                  │
+  │   └──────────┬──────────────┘    │                                  │
+  │              ▼                   │                                  │
+  │   RMSNorm → lm_head → argmax     │                                  │
+  │              │                   │                                  │
+  │              │ 16 draft tokens   │                                  │
+  │              └───────────────────┘                                  │
+  │              fed to target for verification                         │
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### KV cache: cross-attention, not self-attention
+### KV cache cross-attention
 
-In a standard transformer, the KV cache stores keys/values from **previous tokens in the same sequence** -- it grows by one row per decode step and K/V come from the same input as Q.
+In a standard transformer, the KV cache stores keys/values from previous tokens in the same sequence and grows by one row per decode step and K/V come from the same input as Q.
 
-DFlash's KV cache is different. K and V come from two sources:
+DFlash's KV cache comes from two sources:
 
-1. **Context** (from the target model's hidden states) -- this is the cross-attention part. The context grows by the number of accepted tokens each step, not by one.
-2. **Noise** (the draft token embeddings) -- these 16 rows are recomputed every step and never cached.
+1. **Context** (from the target model's hidden states): the context grows by the number of accepted tokens each step, not by one.
+2. **Noise** (the draft token embeddings): these 16 rows are recomputed every step and never cached.
 
 The cache stores post-QKnorm + post-RoPE K and raw V for the context portion only. Each step:
-- Compute K/V only for **new context + noise** (small matmul, ~64 rows)
+- Compute K/V only for new context + noise
 - Concat cached K/V with new K/V for attention
 - After accept/reject, slice the context portion into the updated cache
 
-At 120k context this gives 9.6x speedup vs recomputing all K/V each step.
-
 ## Op mapping: TT-Lang vs TTNN
 
-| Operation | Backend | Notes |
+| Operation | Impl | Notes |
 |-----------|---------|-------|
 | RoPE | TT-Lang | Element-wise, works on mesh |
 | Softmax | TT-Lang | Fused row-wise softmax (non-cached path) |
@@ -110,6 +108,7 @@ CPU Qwen3 (stock `transformers`) for prefill/verify. DFlash entirely on Tenstorr
 | `dflash_draft.py` | DFlash draft model (TTNN + TT-Lang) |
 | `device.py` | Shared device infra (mesh open/close, tensor placement) |
 | `qwen3.py` | Standalone Qwen3 target model on device (4-chip TP) |
+| `qwen3_inference.py` | Qwen3 target inference entry point (device only, no DFlash) |
 | `spec_decode.py` | Full device spec decode (both target + draft on TT) |
 | `src/` | TT-Lang fused kernels (rmsnorm, rope, softmax, silu_mul, residual_add) |
 | `model/` | Original PyTorch DFlash model |
