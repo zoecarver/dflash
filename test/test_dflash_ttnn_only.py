@@ -13,6 +13,7 @@ from rope import make_rope_kernel
 from dflash_draft import (
     draft_fwd_cached, setup_rope_tables_cached, prepare_context_ttnn,
     load_draft_weights, setup_rope_tables, draft_fwd_ttnn,
+    prealloc_cached_scratch,
     to_dev as dd_to_dev, _tile_pad,
 )
 
@@ -325,6 +326,7 @@ def main():
             to_dev(new_ctx_data, d), cw, d)
         cache_len = cache[0]["k"].shape[2]
         setup_rope_tables_cached(cw, cache_len, new_ctx_sp, d)
+        sc = prealloc_cached_scratch(new_ctx_sp + SP, d)
 
         print(f"  Cached forward (new_ctx={new_ctx_sp}, cache={cache_len})...")
         n_warmup_c = 2
@@ -332,13 +334,13 @@ def main():
 
         for _ in range(n_warmup_c):
             noise_dev_c = to_dev(noise_bf, d)
-            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache)
+            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
             ttnn.synchronize_device(d)
 
         t0 = time.perf_counter()
         for _ in range(n_timed_c):
             noise_dev_c = to_dev(noise_bf, d)
-            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache)
+            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
             ttnn.synchronize_device(d)
         elapsed_c = time.perf_counter() - t0
         per_fwd_c = elapsed_c / n_timed_c * 1000

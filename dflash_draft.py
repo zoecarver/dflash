@@ -385,6 +385,17 @@ def prepare_context_ttnn(target_hidden, w, d):
 # ---------------------------------------------------------------------------
 # KV-cached forward
 # ---------------------------------------------------------------------------
+def prealloc_cached_scratch(new_kv_sp, d):
+    """Pre-allocate reusable scratch tensors for cached forward.
+
+    new_kv_sp: tile-padded (new_ctx_sp + SP), fixed during decode.
+    """
+    return {
+        "q_roped": to_dev(torch.zeros(SP, NQH * HDIM), d),
+        "new_k_roped": to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d),
+    }
+
+
 def setup_rope_tables_cached(w, cache_len, new_ctx_sp, d):
     """RoPE tables and softmax kernel for cached forward.
 
@@ -403,12 +414,13 @@ def setup_rope_tables_cached(w, cache_len, new_ctx_sp, d):
     w["total_kv"] = total_kv
 
 
-def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
+def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     """Single layer forward with KV cache.
 
     h: noise hidden states (SP, HIDDEN)
     new_ctx: new context rows (new_ctx_sp, HIDDEN), already projected+normed
     layer_cache: {"k": (1, NKVH, cache_len, HDIM), "v": same} in 4D or None
+    scratch: pre-allocated tensors from prealloc_cached_scratch, or None
     Returns: (h_out, updated_layer_cache)
     """
     new_ctx_sp = new_ctx.shape[0]
@@ -448,9 +460,13 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
     new_k_normed = ttnn.reshape(new_k_normed_flat, (new_kv_sp, NKVH * HDIM))
 
     # RoPE on Q and new K only
-    q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    if scratch is not None:
+        q_roped = scratch["q_roped"]
+        new_k_roped = scratch["new_k_roped"]
+    else:
+        q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
+        new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
     q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
-    new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
     k_rope_k(new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
 
     # Reshape new K/V to 4D for cache concat and SDPA
@@ -517,19 +533,20 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
     return h, updated
 
 
-def draft_fwd_cached(noise, new_ctx, w, d, cache):
+def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
     """8-layer draft forward with KV cache.
 
     noise: (SP, HIDDEN) noise embedding on device
     new_ctx: (new_ctx_sp, HIDDEN) new context rows, already projected+normed
     cache: list of 8 layer caches, or None for first call
+    scratch: pre-allocated tensors from prealloc_cached_scratch, or None
     Returns: (output, updated_cache)
     """
     h = noise
     new_cache = []
     for li in range(DLAYERS):
         lc = cache[li] if cache is not None else None
-        h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc)
+        h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc, scratch)
         new_cache.append(updated_lc)
     # Final RMSNorm
     if TTLANG_RMSNORM:
