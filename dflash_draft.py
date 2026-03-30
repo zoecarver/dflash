@@ -408,12 +408,13 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
 
     h: noise hidden states (SP, HIDDEN)
     new_ctx: new context rows (new_ctx_sp, HIDDEN), already projected+normed
-    layer_cache: {"k": (cache_len, NKVH*HDIM), "v": same} or None
+    layer_cache: {"k": (1, NKVH, cache_len, HDIM), "v": same} in 4D or None
     Returns: (h_out, updated_layer_cache)
     """
     new_ctx_sp = new_ctx.shape[0]
     new_kv_sp = w["new_kv_sp"]
     total_kv = w["total_kv"]
+    cache_len = w["total_kv"] - new_kv_sp  # = cache_len passed to setup
 
     # Input RMSNorm
     if TTLANG_RMSNORM:
@@ -452,18 +453,20 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
     new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
     k_rope_k(new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
 
-    # Build full K/V: cached + new
+    # Reshape new K/V to 4D for cache concat and SDPA
+    new_k_4d = ttnn.transpose(ttnn.reshape(new_k_roped, (1, new_kv_sp, NKVH, HDIM)), 1, 2)
+    new_v_4d = ttnn.transpose(ttnn.reshape(new_v, (1, new_kv_sp, NKVH, HDIM)), 1, 2)
+
+    # Build full K/V in 4D: cached + new (concat along seq dim)
     if layer_cache is not None:
-        full_k = ttnn.concat([layer_cache["k"], new_k_roped], dim=0)
-        full_v = ttnn.concat([layer_cache["v"], new_v], dim=0)
+        k4 = ttnn.concat([layer_cache["k"], new_k_4d], dim=2)
+        v4 = ttnn.concat([layer_cache["v"], new_v_4d], dim=2)
     else:
-        full_k = new_k_roped
-        full_v = new_v
+        k4 = new_k_4d
+        v4 = new_v_4d
 
     # SDPA: fused Q×K^T + scale + softmax + probs×V
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
-    k4 = ttnn.transpose(ttnn.reshape(full_k, (1, total_kv, NKVH, HDIM)), 1, 2)
-    v4 = ttnn.transpose(ttnn.reshape(full_v, (1, total_kv, NKVH, HDIM)), 1, 2)
     attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
@@ -504,16 +507,12 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
     else:
         h = ttnn.add(h, down)
 
-    # Update cache: context portion of new K/V (exclude noise at the end)
-    new_ctx_k = ttnn.slice(new_k_roped, [0, 0], [new_ctx_sp, NKVH * HDIM])
-    new_ctx_v = ttnn.slice(new_v, [0, 0], [new_ctx_sp, NKVH * HDIM])
-    if layer_cache is not None:
-        updated = {
-            "k": ttnn.concat([layer_cache["k"], new_ctx_k], dim=0),
-            "v": ttnn.concat([layer_cache["v"], new_ctx_v], dim=0),
-        }
-    else:
-        updated = {"k": new_ctx_k, "v": new_ctx_v}
+    # Cache update: slice context portion from full K/V (already built for SDPA)
+    ctx_end = cache_len + new_ctx_sp
+    updated = {
+        "k": ttnn.slice(k4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
+        "v": ttnn.slice(v4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
+    }
 
     return h, updated
 

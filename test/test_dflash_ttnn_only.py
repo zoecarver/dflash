@@ -318,12 +318,12 @@ def main():
         _, cache = draft_fwd_cached(noise_dev_c, ctx_proj, cw, d, None)
         ttnn.synchronize_device(d)
         print(f"  Cache populated in {time.time()-t0:.1f}s")
-        print(f"  Cache size: {cache[0]['k'].shape[0]} rows/layer")
+        print(f"  Cache size: {cache[0]['k'].shape[2]} rows/layer")
 
         # Subsequent calls: small incremental update
         new_ctx_dev = prepare_context_ttnn(
             to_dev(new_ctx_data, d), cw, d)
-        cache_len = cache[0]["k"].shape[0]
+        cache_len = cache[0]["k"].shape[2]
         setup_rope_tables_cached(cw, cache_len, new_ctx_sp, d)
 
         print(f"  Cached forward (new_ctx={new_ctx_sp}, cache={cache_len})...")
