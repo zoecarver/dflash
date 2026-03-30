@@ -77,7 +77,7 @@ Two flags in the script control which ops use TT-Lang fused kernels vs TTNN:
 
 This is a run using the cpu base model + on device dflash. `acc` is the number of accepted tokens. Timing is incorrect in the snippet below due to host <-> device transfers. 
 
-Profiled runs without device transfers: standalone at 64 token context, dflash runs in 7.9ms. At 250k context it takes 1762ms (kv caching not implemented yet).
+Profiled runs without device transfers: standalone at 64 token context, dflash runs in 7.9ms. At 250k context it takes 180ms. At 120k it takes 90ms. Without kv caching at 250k context it takes 1762ms.
 
 ```
    step 1: acc=2/16 avg=2.0 1.5s gen=2

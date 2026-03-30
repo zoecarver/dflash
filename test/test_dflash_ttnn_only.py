@@ -156,7 +156,7 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
 
 def main():
     torch.manual_seed(42)
-    ctx_len = 250_000
+    ctx_len = 120_000
     ctx_sp = _tile_pad(ctx_len)
     kv_len = ctx_len + BSIZE
     kv_sp = ctx_sp + SP
