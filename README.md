@@ -42,7 +42,7 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
   │   │  SDPA (non-causal, GQA) │    │                                  │
   │   │  O proj + residual      │    │                                  │
   │   │  MLP + residual         │    │                                  │
-  │   │  KV cache: ctx K,V      │    │                                  │
+  │   │  KV cache (grow+crop)    │    │                                  │
   │   └──────────┬──────────────┘    │                                  │
   │              ▼                   │                                  │
   │   RMSNorm → lm_head → argmax     │                                  │
@@ -74,14 +74,14 @@ This matches the reference implementation which uses `DynamicCache.update()` to 
 | Operation | Impl | Notes |
 |-----------|---------|-------|
 | RoPE | TT-Lang | Element-wise, works on mesh |
-| Softmax | TT-Lang | Fused row-wise softmax (non-cached path) |
 | Residual add | TT-Lang | Fused element-wise |
 | SiLU * mul | TT-Lang | Fused MLP activation |
 | RMSNorm | TTNN | TT-Lang version has ~0.63x magnitude bug on mesh |
 | QKV/O/MLP projections | TTNN matmul | Large weight matmuls |
-| Attention (cached) | TTNN SDPA | Fused flash attention |
+| Attention | TTNN SDPA | Fused flash attention (non-causal, GQA) |
 | Context projection | TTNN matmul | Split 5-way for bf16 precision |
 | Argmax | TTNN | On-device token selection |
+| Softmax | TT-Lang | Row-wise fused kernel; unused (SDPA handles it) |
 
 Controlled by `TTLANG_ENABLED` and `TTLANG_RMSNORM` flags in `dflash_draft.py`.
 
@@ -106,7 +106,7 @@ CPU Qwen3 (stock `transformers`) for prefill/verify. DFlash entirely on Tenstorr
 
 | File | Description |
 |------|-------------|
-| `qwen3_cpu_tt_dflash.py` | Main entry point: CPU target + device DFlash |
+| `qwen3_cpu_tt_dflash.py` | Main entry point: CPU target + device DFlash (KV-cached draft) |
 | `dflash_draft.py` | DFlash draft model (TTNN + TT-Lang) |
 | `device.py` | Shared device infra (mesh open/close, tensor placement) |
 | `qwen3.py` | Standalone Qwen3 target model on device (4-chip TP) |
@@ -118,15 +118,15 @@ CPU Qwen3 (stock `transformers`) for prefill/verify. DFlash entirely on Tenstorr
 
 ## Performance
 
-Profiled standalone DFlash forward (no host transfers):
+Profiled standalone DFlash forward (no host transfers). Non-cached recomputes K/V projections, QK-norm, and RoPE for the entire context every step. Cached stores post-RoPE K and raw V, only computing new rows each step.
 
-| Context length | Non-cached | Cached | Speedup |
+| Context length | Non-cached | Cached (ctx only) | Cached (ctx+noise) |
 |---|---|---|---|
 | 64 | 7.9ms | -- | -- |
-| 120k | 897ms | 93ms | 9.6x |
-| 250k | 1750ms | 180ms | 9.7x |
+| 120k | 887ms | 93ms | 80ms |
+| 250k | 1727ms | 180ms | 158ms |
 
-Note: current cached forward bottleneck is 2x concat of cached K/V (250k rows) per layer for SDPA input.
+Note: current cached forward bottleneck is 2x concat of cached K/V per layer for SDPA input.
 
 ## Example run
 
