@@ -114,9 +114,6 @@ def to_dev(t, d):
 # TTNN-based layer forward (TT-Lang rope only, everything else TTNN)
 # ---------------------------------------------------------------------------
 def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
-    scale = 1.0 / (HDIM ** 0.5)
-
-    # ttnn.rms_norm for input layernorm
     normed = ttnn.rms_norm(h, weight=dw[f"in_w.{li}"], epsilon=EPS)
 
     q = ttnn.matmul(normed, dw[f"qw.{li}"])
@@ -124,7 +121,6 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     k = ttnn.matmul(kv_in, dw[f"kw.{li}"])
     v = ttnn.matmul(kv_in, dw[f"vw.{li}"])
 
-    # QK-norm (already using ttnn.rms_norm)
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
     q_normed_flat = ttnn.rms_norm(q_flat, weight=dw[f"qnw.{li}"], epsilon=EPS)
@@ -132,40 +128,24 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
 
-    # TT-Lang rope (keep for now)
     q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
     k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
     q_rope_k(q_normed, dw["rope_cos_q"], dw["rope_sin_q"], q_roped)
     k_rope_k(k_normed, dw["rope_cos_kv"], dw["rope_sin_kv"], k_roped)
 
-    # Stacked Q + batched matmul
+    # SDPA: fused attention
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
     k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
     v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
-    q_grouped = ttnn.reshape(q4, (1, NKVH, GQA * SP, HDIM))
-    k_t = ttnn.transpose(k4, -2, -1)
-    scores = ttnn.matmul(q_grouped, k_t)
-    scores = ttnn.multiply(scores, scale)
-
-    # ttnn.softmax instead of TT-Lang
-    probs = ttnn.softmax(scores, dim=-1)
-
-    attn_4d = ttnn.matmul(probs, v4)
-    attn_heads = ttnn.reshape(attn_4d, (1, NQH, SP, HDIM))
-    attn_flat = ttnn.reshape(ttnn.transpose(attn_heads, 1, 2), (SP, NQH * HDIM))
+    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+    attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, dw[f"ow.{li}"])
-
-    # ttnn.add for residual
     h = ttnn.add(h, o)
 
-    # ttnn.rms_norm for post-attention
     normed2 = ttnn.rms_norm(h, weight=dw[f"pa_w.{li}"], epsilon=EPS)
-
     gate = ttnn.matmul(normed2, dw[f"gw.{li}"])
     up = ttnn.matmul(normed2, dw[f"uw.{li}"])
-
-    # ttnn.silu + ttnn.mul
     act = ttnn.mul(ttnn.silu(gate), up)
     down = ttnn.matmul(act, dw[f"fc2.{li}"])
 

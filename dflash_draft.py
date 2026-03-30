@@ -161,8 +161,6 @@ def setup_rope_tables(w, ctx_sp, d, q_start=None):
     w["rope_cos_kv"] = to_dev(kv_cos, d)
     w["rope_sin_kv"] = to_dev(kv_sin, d)
     w["kv_sp"] = kv_sp
-    total_q_rows = NKVH * GQA * SP
-    w["softmax_k"] = make_softmax_kernel(total_q_rows // TILE, kv_sp // TILE)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +263,6 @@ def prepare_context(target_hidden, w, d):
 # ---------------------------------------------------------------------------
 def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     """Single layer forward. Uses TT-Lang kernels when TTLANG_ENABLED."""
-    scale = 1.0 / (HDIM ** 0.5)
     kv_sp = w["kv_sp"]
 
     # Input RMSNorm: TT-Lang or TTNN
@@ -302,27 +299,12 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
     k_rope_k(k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
 
+    # SDPA: fused Q×K^T + scale + softmax + probs×V
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
     k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
     v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
-    q_grouped = ttnn.reshape(q4, (1, NKVH, GQA * SP, HDIM))
-    k_t = ttnn.transpose(k4, -2, -1)
-    scores = ttnn.matmul(q_grouped, k_t)
-    scores = ttnn.multiply(scores, scale)
-
-    # Softmax: TT-Lang or TTNN
-    if TTLANG_ENABLED:
-        total_q_rows = NKVH * GQA * SP
-        scores_flat = ttnn.reshape(scores, (total_q_rows, kv_sp))
-        probs_flat = to_dev(torch.zeros(total_q_rows, kv_sp), d)
-        w["softmax_k"](scores_flat, w["sc"], probs_flat)
-        probs = ttnn.reshape(probs_flat, (1, NKVH, GQA * SP, kv_sp))
-    else:
-        probs = ttnn.softmax(scores, dim=-1)
-
-    attn_4d = ttnn.matmul(probs, v4)
-    attn_heads = ttnn.reshape(attn_4d, (1, NQH, SP, HDIM))
-    attn_flat = ttnn.reshape(ttnn.transpose(attn_heads, 1, 2), (SP, NQH * HDIM))
+    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+    attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
 
