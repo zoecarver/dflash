@@ -28,6 +28,8 @@ TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
 # Set True to use TT-Lang kernels for softmax, residual_add, silu_mul
 USE_TTLANG = True
 dflash_draft.TTLANG_ENABLED = USE_TTLANG
+# TT-Lang rmsnorm has ~0.63x magnitude bug on mesh -- enable to test the flow
+dflash_draft.TTLANG_RMSNORM = False
 
 
 def extract_context_feature(hidden_states, layer_ids):

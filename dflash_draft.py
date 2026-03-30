@@ -69,6 +69,7 @@ def to_dev(t, d):
 # Kernel instances
 # ---------------------------------------------------------------------------
 norm_k = make_rmsnorm_kernel(dim_tiles=HTILES, eps=EPS)
+head_norm_k = make_rmsnorm_kernel(dim_tiles=HDIM_TILES, eps=EPS)
 q_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NQH)
 k_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NKVH)
 
@@ -111,6 +112,8 @@ def load_draft_weights(d):
             knw = f.get_tensor(f"{dp}.self_attn.k_norm.weight").to(torch.bfloat16)
             w[f"qnw.{li}"] = to_dev(qnw.unsqueeze(0).contiguous(), d)
             w[f"knw.{li}"] = to_dev(knw.unsqueeze(0).contiguous(), d)
+            w[f"qnw_tt.{li}"] = to_dev(qnw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+            w[f"knw_tt.{li}"] = to_dev(knw.unsqueeze(0).expand(TILE, -1).contiguous(), d)
             w[f"gw.{li}"] = to_dev(f.get_tensor(f"{dp}.mlp.gate_proj.weight").T.contiguous().to(torch.bfloat16), d)
             w[f"uw.{li}"] = to_dev(f.get_tensor(f"{dp}.mlp.up_proj.weight").T.contiguous().to(torch.bfloat16), d)
             w[f"fc2.{li}"] = to_dev(f.get_tensor(f"{dp}.mlp.down_proj.weight").T.contiguous().to(torch.bfloat16), d)
@@ -130,6 +133,7 @@ def load_draft_weights(d):
 
     w["sc"] = to_dev(torch.ones(TILE, TILE), d)
     w["ms"] = to_dev(torch.full((TILE, TILE), 1.0 / HIDDEN), d)
+    w["ms_head"] = to_dev(torch.full((TILE, TILE), 1.0 / HDIM), d)
 
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return w
@@ -264,7 +268,12 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     scale = 1.0 / (HDIM ** 0.5)
     kv_sp = w["kv_sp"]
 
-    normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
+    # Input RMSNorm: TT-Lang or TTNN
+    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+        normed = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
+    else:
+        normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
 
     q = ttnn.matmul(normed, w[f"qw.{li}"])
     kv_in = ttnn.concat([ctx_dev, normed], dim=0)
@@ -273,8 +282,17 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
 
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
-    q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
-    k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
+
+    # QK-norm RMSNorm: TT-Lang or TTNN
+    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+        q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
+        head_norm_k(q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+        k_normed_flat = to_dev(torch.zeros(kv_sp * NKVH, HDIM), d)
+        head_norm_k(k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], k_normed_flat)
+    else:
+        q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
+        k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
+
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
 
@@ -316,7 +334,12 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     else:
         h = ttnn.add(h, o)
 
-    normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
+    # Post-attention RMSNorm: TT-Lang or TTNN
+    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+        normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
+    else:
+        normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
     gate = ttnn.matmul(normed2, w[f"gw.{li}"])
     up = ttnn.matmul(normed2, w[f"uw.{li}"])
@@ -340,11 +363,17 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
 
 
 def draft_fwd_ttnn(noise, ctx, w, d):
-    """Full 8-layer draft forward using TTNN ops only."""
+    """Full 8-layer draft forward."""
     h = noise
     for li in range(DLAYERS):
         h = draft_layer_fwd_ttnn(h, ctx, w, li, d)
-    return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS)
+    # Final RMSNorm: TT-Lang or TTNN
+    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+        out = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w["fn_w_tt"], w["sc"], w["ms"], out)
+        return out
+    else:
+        return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS)
 
 
 def prepare_context_ttnn(target_hidden, w, d):
@@ -362,4 +391,10 @@ def prepare_context_ttnn(target_hidden, w, d):
     ctx_proj = parts[0]
     for p in parts[1:]:
         ctx_proj = ttnn.add(ctx_proj, p)
-    return ttnn.rms_norm(ctx_proj, weight=w["hn_w"], epsilon=EPS)
+    # Context RMSNorm: TT-Lang or TTNN
+    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+        ctx_norm = to_dev(torch.zeros(ctx_sp, HIDDEN), d)
+        norm_k(ctx_proj, w["hn_w_tt"], w["sc"], w["ms"], ctx_norm)
+        return ctx_norm
+    else:
+        return ttnn.rms_norm(ctx_proj, weight=w["hn_w"], epsilon=EPS)
