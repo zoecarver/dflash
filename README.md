@@ -131,25 +131,19 @@ Note: current cached forward bottleneck is 2x concat of cached K/V per layer for
 ## Example run
 
 ```
-   step 1: acc=2/16 avg=2.0 1.5s gen=2
-   step 2: acc=1/16 avg=1.5 1.0s gen=3
-   step 3: acc=2/16 avg=1.7 1.1s gen=5
-   step 4: acc=1/16 avg=1.5 1.1s gen=6
-   step 5: acc=3/16 avg=1.8 1.1s gen=9
-   step 6: acc=2/16 avg=1.8 1.1s gen=11
-   step 7: acc=3/16 avg=2.0 1.1s gen=14
-   step 8: acc=2/16 avg=2.0 1.2s gen=16
-   step 9: acc=3/16 avg=2.1 1.2s gen=19
-   step 10: acc=3/16 avg=2.2 1.2s gen=22
-   step 11: acc=6/16 avg=2.5 1.3s gen=28
-   step 12: acc=6/16 avg=2.8 1.3s gen=34
-   step 13: acc=1/16 avg=2.7 1.4s gen=35
-   step 14: acc=3/16 avg=2.7 1.3s gen=38
-   step 15: acc=5/16 avg=2.9 1.4s gen=43
-   step 16: acc=5/16 avg=3.0 1.4s gen=48
-   step 17: acc=6/16 avg=3.2 1.5s gen=54
-   step 18: acc=7/16 avg=3.4 1.5s gen=61
-   step 19: acc=12/16 avg=3.8 1.5s gen=73
+   step 1: acc=5/16 avg=5.0 1.2s gen=5
+   step 2: acc=1/16 avg=3.0 1.1s gen=6
+   step 3: acc=4/16 avg=3.3 1.1s gen=10
+   step 4: acc=3/16 avg=3.2 1.1s gen=13
+   step 5: acc=1/16 avg=2.8 1.2s gen=14
+   step 6: acc=2/16 avg=2.7 1.2s gen=16
+   step 7: acc=3/16 avg=2.7 2.0s gen=19
+   step 8: acc=3/16 avg=2.8 1.2s gen=22
+   step 9: acc=12/16 avg=3.8 1.3s gen=34
+   step 10: acc=1/16 avg=3.5 1.4s gen=35
+   step 11: acc=8/16 avg=3.9 1.4s gen=43
+   step 12: acc=11/16 avg=4.5 1.4s gen=54
+   step 13: acc=15/16 avg=5.3 2.3s gen=69
 
 --- Output ---
 user
@@ -168,4 +162,4 @@ def fibonacci_recursive(n):
     return 0
 ```
 
-Average acceptance: 3.6 tokens/step (CPU reference: 5.3). The gap requires further investigation (likely due to bf16 precision). TTNN and TT-Lang impls have same acceptance rate / PCC.
+Average acceptance: 5.3 tokens/step, matching the CPU reference. Uses non-cached forward with attention masking to eliminate tile-padding dilution. The cached forward path has lower acceptance (2.3) due to stale data from `ttnn.concat` of sliced cache tensors; see KV cache section for tradeoffs.

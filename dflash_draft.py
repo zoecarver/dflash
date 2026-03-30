@@ -142,13 +142,35 @@ def load_draft_weights(d):
     return w
 
 
-def setup_rope_tables(w, ctx_sp, d, q_start=None):
+def _build_attn_mask(kv_sp, real_positions, d):
+    """Build additive attention mask for SDPA: 0 = attend, -inf = ignore.
+
+    kv_sp: total (tile-padded) K/V sequence length
+    real_positions: list of (start, end) ranges that are real (non-padding)
+    d: device
+    Returns: ttnn tensor of shape (1, 1, SP, kv_sp) in bfloat16
+    """
+    # Start with large negative (masked), set real positions to 0
+    NEG_INF = -1e9  # bf16-safe large negative; true -inf can cause NaN
+    mask = torch.full((1, 1, SP, kv_sp), NEG_INF, dtype=torch.bfloat16)
+    for s, e in real_positions:
+        mask[:, :, :, s:e] = 0.0  # all Q rows (including padding) attend to real K/V
+    kw = {}
+    if isinstance(d, ttnn.MeshDevice):
+        kw["mesh_mapper"] = ttnn.ReplicateTensorToMesh(d)
+    return ttnn.from_torch(mask, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                           device=d, memory_config=ttnn.DRAM_MEMORY_CONFIG, **kw)
+
+
+def setup_rope_tables(w, ctx_sp, d, q_start=None, ctx_real=None):
     """Upload RoPE tables sized for a given tile-padded context length.
 
     ctx_sp: tile-padded context rows. kv_sp = ctx_sp + SP (context + draft).
     q_start: actual start position for Q/noise tokens (default: ctx_sp).
              When ctx_sp > q_start due to tile padding, this corrects the RoPE
              positions so noise tokens get their true positions.
+    ctx_real: real (unpadded) context length. When provided, builds an attention
+              mask to ignore tile-padding positions in SDPA.
     """
     if q_start is None:
         q_start = ctx_sp
@@ -164,6 +186,12 @@ def setup_rope_tables(w, ctx_sp, d, q_start=None):
     w["rope_cos_kv"] = to_dev(kv_cos, d)
     w["rope_sin_kv"] = to_dev(kv_sin, d)
     w["kv_sp"] = kv_sp
+    # Attention mask: mark real context + real noise positions
+    if ctx_real is not None:
+        real_positions = [(0, ctx_real), (ctx_sp, ctx_sp + BSIZE)]
+        w["attn_mask"] = _build_attn_mask(kv_sp, real_positions, d)
+    else:
+        w["attn_mask"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +334,9 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
     k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
     v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
-    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+    attn_mask = w.get("attn_mask")
+    attn = ttnn.transformer.scaled_dot_product_attention(
+        q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
@@ -399,14 +429,17 @@ def prealloc_cached_scratch(new_kv_sp, d):
     }
 
 
-def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None):
+def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None,
+                             new_ctx_real=None):
     """RoPE tables for cached forward.
 
-    cache_rows: tile-padded rows in cache tensor
+    cache_rows: rows in cache tensor (exact, post-crop)
     new_ctx_sp: tile-padded new context rows
     q_start: actual position of noise tokens (default: cache_rows + new_ctx_sp).
              Use this when cache_rows includes tile padding beyond the real
              sequence length, so noise K and Q get matching RoPE positions.
+    new_ctx_real: real (unpadded) new context length. When provided, builds an
+                  attention mask to ignore tile-padding in SDPA.
     """
     new_kv_sp = new_ctx_sp + SP
     if q_start is None:
@@ -423,6 +456,18 @@ def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None):
     w["rope_sin_new_kv"] = to_dev(kv_sin, d)
     w["new_kv_sp"] = new_kv_sp
     w["total_kv"] = cache_rows + new_kv_sp
+    # Attention mask: cache rows are all real (exact crop), new has padding
+    if new_ctx_real is not None:
+        total_kv = cache_rows + new_kv_sp
+        new_kv_offset = cache_rows
+        real_positions = [
+            (0, cache_rows),                                              # cached K/V
+            (new_kv_offset, new_kv_offset + new_ctx_real),                # new context
+            (new_kv_offset + new_ctx_sp, new_kv_offset + new_ctx_sp + BSIZE),  # noise
+        ]
+        w["attn_mask"] = _build_attn_mask(total_kv, real_positions, d)
+    else:
+        w["attn_mask"] = None
 
 
 def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
@@ -494,7 +539,9 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
 
     # SDPA: fused Q×K^T + scale + softmax + probs×V
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
-    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+    attn_mask = w.get("attn_mask")
+    attn = ttnn.transformer.scaled_dot_product_attention(
+        q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, w[f"ow.{li}"])

@@ -17,9 +17,8 @@ from device import (
 )
 import dflash_draft
 from dflash_draft import (
-    load_draft_weights, draft_fwd_ttnn, draft_fwd_cached,
-    prepare_context_ttnn, setup_rope_tables, setup_rope_tables_cached,
-    crop_cache, prealloc_cached_scratch,
+    load_draft_weights, draft_fwd_ttnn,
+    prepare_context_ttnn, setup_rope_tables,
     to_dev as draft_to_dev,
     BSIZE, TLAYER_IDS, MASK_ID, SP, N_CTX_LAYERS,
     _tile_pad,
@@ -32,8 +31,6 @@ USE_TTLANG = True
 dflash_draft.TTLANG_ENABLED = USE_TTLANG
 # TT-Lang rmsnorm has ~0.63x magnitude bug on mesh -- enable to test the flow
 dflash_draft.TTLANG_RMSNORM = False
-# Disable noise caching to test acceptance rate impact
-dflash_draft.CACHE_NOISE = False
 
 
 def extract_context_feature(hidden_states, layer_ids):
@@ -84,19 +81,10 @@ def main():
         out[:pl] = input_ids[0]
         out[pl] = torch.argmax(cpu_out.logits[0, -1, :].float()).item()
 
-        # === Device: prepare initial context from CPU hidden states ===
-        ctx_cpu = extract_context_feature(
+        # === Accumulated context on host (re-projected each step) ===
+        all_ctx_cpu = extract_context_feature(
             cpu_out.hidden_states, TLAYER_IDS
-        ).squeeze(0)[:pl].to(torch.bfloat16)  # (pl, 5*HIDDEN)
-        new_ctx_sp = _tile_pad(pl)
-        if new_ctx_sp > pl:
-            pad = ctx_cpu[-1:].expand(new_ctx_sp - pl, -1)
-            ctx_cpu = torch.cat([ctx_cpu, pad], dim=0)
-        new_ctx_dev = prepare_context_ttnn(rep(ctx_cpu, d), dw, d)
-
-        # KV cache state
-        cache = None
-        cache_rows = 0
+        ).squeeze(0)[:pl].to(torch.bfloat16)
 
         start = pl
         gen = 0
@@ -107,18 +95,22 @@ def main():
             ts = time.time()
             bids = out[start:start + BSIZE].clone()
 
-            # === Device: embed, cached draft forward, lm_head, argmax ===
-            setup_rope_tables_cached(dw, cache_rows, new_ctx_sp, d,
-                                     q_start=start)
+            # === Device: non-cached forward with full context ===
+            ctx_sp = _tile_pad(all_ctx_cpu.shape[0])
+            ctx_padded = all_ctx_cpu
+            if ctx_sp > all_ctx_cpu.shape[0]:
+                ctx_padded = F.pad(all_ctx_cpu, (0, 0, 0, ctx_sp - all_ctx_cpu.shape[0]))
+            ctx = prepare_context_ttnn(rep(ctx_padded, d), dw, d)
+            setup_rope_tables(dw, ctx_sp, d, q_start=start,
+                              ctx_real=all_ctx_cpu.shape[0])
+
             noise = _p(emb_weight[bids])
             if noise.shape[0] < SP:
                 noise = F.pad(noise, (0, 0, 0, SP - noise.shape[0]))
             noise_dev = draft_to_dev(noise, d)
 
-            dout, cache = draft_fwd_cached(
-                noise_dev, new_ctx_dev, dw, d, cache)
+            dout = draft_fwd_ttnn(noise_dev, ctx, dw, d)
             dl = ttnn.matmul(dout, dw["lm_head_rep"])
-            # Argmax on device, readback just the token IDs
             draft_tokens = ttnn.argmax(dl, dim=-1)
             draft_ids = rb(draft_tokens)[:BSIZE].long().squeeze(-1)
             bids[1:] = draft_ids[1:BSIZE]
@@ -130,7 +122,7 @@ def main():
             vlh = cpu_vout.logits[0, start:start + BSIZE, :VOCAB].float()
             post = torch.argmax(vlh, dim=-1)
 
-            # Accept/reject (15 integers, trivial)
+            # Accept/reject
             acc = (bids[1:] == post[:-1]).to(torch.int64).cumprod(0).sum().item()
             out[start:start+acc+1] = bids[:acc+1]
             out[start+acc+1] = post[acc]
@@ -139,25 +131,11 @@ def main():
             gen += acc + 1
             ahist.append(acc + 1)
 
-            # === Device: crop cache + prepare new context ===
-            if dflash_draft.CACHE_NOISE:
-                # Crop to exact start to remove rejected noise positions.
-                cache_rows = start
-                cache = crop_cache(cache, cache_rows)
-            else:
-                # Context-only cache: no noise to crop, cache_rows = ctx rows
-                cache_rows = cache[0]["k"].shape[2]
-
-            # Only extract NEW context (accepted positions from this step)
-            new_ctx_cpu = extract_context_feature(
+            # Update accumulated context from verification
+            new_ctx = extract_context_feature(
                 cpu_vout.hidden_states, TLAYER_IDS
             ).squeeze(0)[old_start:old_start + acc + 1].to(torch.bfloat16)
-            new_ctx_real = acc + 1
-            new_ctx_sp = _tile_pad(new_ctx_real)
-            if new_ctx_sp > new_ctx_real:
-                pad = new_ctx_cpu[-1:].expand(new_ctx_sp - new_ctx_real, -1)
-                new_ctx_cpu = torch.cat([new_ctx_cpu, pad], dim=0)
-            new_ctx_dev = prepare_context_ttnn(rep(new_ctx_cpu, d), dw, d)
+            all_ctx_cpu = torch.cat([all_ctx_cpu, new_ctx], dim=0)
 
             el = time.time() - ts
             avg = sum(ahist) / len(ahist)
