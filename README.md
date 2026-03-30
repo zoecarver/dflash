@@ -6,48 +6,51 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
 
 ## DFlash model architecture
 
-DFlash is **not** a standard autoregressive transformer. It's a non-autoregressive cross-attention model: output at position i predicts token i (not i+1). All 16 positions are predicted simultaneously.
-
 ```
-                        target model (Qwen3-30B-A3B)
-                        ┌─────────────────────────┐
-                        │  48 layers, self-attn    │
-  prompt ──────────────>│  + MoE                   │──> logits (verify)
-                        │                          │
-                        │  hidden states at        │
-                        │  layers [1,12,23,34,45]  │
-                        └──────────┬──────────────┘
-                                   │
-                                   │ 5 x (seq, 2048)
-                                   ▼
-                        ┌──────────────────────┐
-                        │ context projection   │  FC(10240→2048) + RMSNorm
-                        │ (once per verify)    │  split into 5 x matmul for bf16 precision
-                        └──────────┬───────────┘
-                                   │
-                                   │ ctx: (seq, 2048)
-                                   ▼
-               ┌──────────────────────────────────────┐
-               │         DFlash layer (x8)            │
-               │                                      │
-               │  noise = embed(draft_tokens)  (16,2048)
-               │                                      │
-               │  ┌─ RMSNorm(noise)                   │
-               │  ├─ Q = proj(noise)          (16,4096)
-               │  ├─ K = proj([ctx; noise])   (seq+16, 512)
-               │  ├─ V = proj([ctx; noise])   (seq+16, 512)
-               │  ├─ QK-norm (per-head RMSNorm)       │
-               │  ├─ RoPE on Q and K                   │
-               │  ├─ SDPA (non-causal, GQA 32q/4kv)   │
-               │  ├─ O projection + residual           │
-               │  ├─ RMSNorm                           │
-               │  └─ MLP (gate/up/silu/down) + residual│
-               │                                      │
-               │  KV cache: ctx portion of K,V        │
-               └──────────┬───────────────────────────┘
-                          │
-                          ▼
-               RMSNorm → lm_head → argmax → 16 draft tokens
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                      speculative decode loop                       │
+  │                                                                    │
+  │   target model (eg Qwen3-30B-A3B)                                 │
+  │   ┌─────────────────────────┐                                     │
+  │   │  48 layers, self-attn   │                                     │
+  │   │  + MoE                  │                                     │
+  │   │                         │                                     │
+  │   │  hidden states at       │                                     │
+  │   │  layers [1,12,23,34,45] │                                     │
+  │   └──────┬─────────────┬────┘                                     │
+  │          │             │                                          │
+  │          │ 5 x hidden  │ logits                                   │
+  │          │ states      │ (seq, vocab)                             │
+  │          ▼             ▼                                          │
+  │   ┌────────────┐  ┌──────────────────────────────┐               │
+  │   │ context    │  │ argmax target logits          │               │
+  │   │ projection │  │ compare with draft proposals: │               │
+  │   │ FC + norm  │  │   draft: [A, B, C, D, ...]   │               │
+  │   └─────┬──────┘  │   target: [A, B, X, ...]     │               │
+  │         │         │   accept prefix [A, B]        │               │
+  │         │ ctx     │   take target's token X       │               │
+  │         │         └──────────────┬────────────────┘               │
+  │         │                        │ accepted tokens                │
+  │         ▼                        │ fed back as next prompt        │
+  │   ┌─────────────────────────┐    │                                │
+  │   │    DFlash layer (x8)    │    │                                │
+  │   │                         │    │                                │
+  │   │  noise = embed(tokens)  │    │                                │
+  │   │  Q from noise           │    │                                │
+  │   │  K,V from [ctx; noise]  │    │                                │
+  │   │  QK-norm + RoPE         │    │                                │
+  │   │  SDPA (non-causal, GQA) │    │                                │
+  │   │  O proj + residual      │    │                                │
+  │   │  MLP + residual         │    │                                │
+  │   │  KV cache: ctx K,V      │    │                                │
+  │   └──────────┬──────────────┘    │                                │
+  │              ▼                   │                                │
+  │   RMSNorm → lm_head → argmax    │                                │
+  │              │                   │                                │
+  │              │ 16 draft tokens   │                                │
+  │              └───────────────────┘                                │
+  │              fed to target for verification                       │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### KV cache: cross-attention, not self-attention
@@ -122,16 +125,46 @@ Profiled standalone DFlash forward (no host transfers):
 | 120k | 897ms | 93ms | 9.6x |
 | 250k | 1750ms | 180ms | 9.7x |
 
-Cached forward bottleneck: 2x concat of cached K/V (250k rows) per layer for SDPA input. TTNN lacks in-place partial tensor writes, so concat is unavoidable.
+Note: current cached forward bottleneck is 2x concat of cached K/V (250k rows) per layer for SDPA input.
 
 ## Example run
 
 ```
-  step 1: acc=2/16 avg=2.0 1.9s gen=2
-  step 5: acc=3/16 avg=1.8 1.1s gen=9
-  step 10: acc=3/16 avg=2.2 1.2s gen=22
-  step 15: acc=5/16 avg=2.9 1.4s gen=43
-  step 20: acc=12/16 avg=3.6 1.5s gen=73
+   step 1: acc=2/16 avg=2.0 1.5s gen=2
+   step 2: acc=1/16 avg=1.5 1.0s gen=3
+   step 3: acc=2/16 avg=1.7 1.1s gen=5
+   step 4: acc=1/16 avg=1.5 1.1s gen=6
+   step 5: acc=3/16 avg=1.8 1.1s gen=9
+   step 6: acc=2/16 avg=1.8 1.1s gen=11
+   step 7: acc=3/16 avg=2.0 1.1s gen=14
+   step 8: acc=2/16 avg=2.0 1.2s gen=16
+   step 9: acc=3/16 avg=2.1 1.2s gen=19
+   step 10: acc=3/16 avg=2.2 1.2s gen=22
+   step 11: acc=6/16 avg=2.5 1.3s gen=28
+   step 12: acc=6/16 avg=2.8 1.3s gen=34
+   step 13: acc=1/16 avg=2.7 1.4s gen=35
+   step 14: acc=3/16 avg=2.7 1.3s gen=38
+   step 15: acc=5/16 avg=2.9 1.4s gen=43
+   step 16: acc=5/16 avg=3.0 1.4s gen=48
+   step 17: acc=6/16 avg=3.2 1.5s gen=54
+   step 18: acc=7/16 avg=3.4 1.5s gen=61
+   step 19: acc=12/16 avg=3.8 1.5s gen=73
+
+--- Output ---
+user
+Write a Python function that computes fibonacci numbers.
+assistant
+Here are several Python implementations of a Fibonacci function, from basic to optimized:
+
+## 1. Basic Recursive Approach
+```python
+def fibonacci_recursive(n):
+  """
+  Compute the nth Fibonacci number using recursion.
+  Time complexity: O(2^n) - Very slow for large n
+  """
+  if n <= 0:
+    return 0
 ```
 
-Average acceptance: 3.6 tokens/step (CPU reference: 5.3). The gap is bf16 precision, not a correctness bug.
+Average acceptance: 3.6 tokens/step (CPU reference: 5.3). The gap requires further investigation (likely due to bf16 precision). TTNN and TT-Lang impls have same acceptance rate / PCC.
