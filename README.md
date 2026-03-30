@@ -16,10 +16,10 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
   │   │  + MoE                  │                                       │
   │   │                         │                                       │
   │   │  hidden states at       │                                       │
-  │   │  layers [1,12,23,34,45] │                                       │
+  │   │  layers [...]           │                                       │
   │   └──────┬─────────────┬────┘                                       │
   │          │             │                                            │
-  │          │ 5 x hidden  │ logits                                     │
+  │          │ 8 x hidden  │ logits                                     │
   │          │ states      │ (seq, vocab)                               │
   │          ▼             ▼                                            │
   │   ┌────────────┐  ┌───────────────────────────────┐                 │
@@ -55,17 +55,19 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
 
 ### KV cache cross-attention
 
-In a standard transformer, the KV cache stores keys/values from previous tokens in the same sequence and grows by one row per decode step and K/V come from the same input as Q.
+In a standard transformer, the KV cache stores keys/values from previous tokens in the same sequence, grows by one row per decode step, and K/V come from the same input as Q.
 
-DFlash's KV cache comes from two sources:
+DFlash's KV cache differs in two ways:
 
-1. **Context** (from the target model's hidden states): the context grows by the number of accepted tokens each step, not by one.
-2. **Noise** (the draft token embeddings): these 16 rows are recomputed every step and never cached.
+1. **K/V come from two sources**: context (target hidden states projected through k/v_proj) and noise (draft token embeddings through k/v_proj). Both are concatenated before attention.
+2. **Grow-then-crop**: each step appends K/V for all new positions (new context + 16 noise), then crops after accept/reject to remove rejected noise. The net cache growth per step is `acceptance_length + 1`.
 
-The cache stores post-QKnorm + post-RoPE K and raw V for the context portion only. Each step:
-- Compute K/V only for new context + noise
-- Concat cached K/V with new K/V for attention
-- After accept/reject, slice the context portion into the updated cache
+The cache stores post-QKnorm + post-RoPE K and raw V. Each step:
+- Compute K/V for new context + noise only (not the full history)
+- Concat cached K/V with new K/V for SDPA
+- After accept/reject, crop cache to keep context + accepted noise positions
+
+This matches the reference implementation which uses `DynamicCache.update()` to append all K/V, then `DynamicCache.crop(start)` to discard rejected positions.
 
 ## Op mapping: TT-Lang vs TTNN
 

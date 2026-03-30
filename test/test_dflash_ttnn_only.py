@@ -13,7 +13,7 @@ from rope import make_rope_kernel
 from dflash_draft import (
     draft_fwd_cached, setup_rope_tables_cached, prepare_context_ttnn,
     load_draft_weights, setup_rope_tables, draft_fwd_ttnn,
-    prealloc_cached_scratch,
+    prealloc_cached_scratch, crop_cache,
     to_dev as dd_to_dev, _tile_pad,
 )
 
@@ -310,37 +310,44 @@ def main():
             cw[f"fc_w.{ci}"] = to_dev(
                 w["fc_w"][ci * HIDDEN:(ci + 1) * HIDDEN, :], d)
 
-        # First call: populate cache with full context
+        # First call: populate cache with full context (like prefill)
         print(f"  Populating cache (ctx={ctx_len})...")
-        setup_rope_tables_cached(cw, 0, ctx_sp, d)
+        setup_rope_tables_cached(cw, 0, ctx_sp, d, q_start=ctx_len)
         noise_dev_c = to_dev(noise_bf, d)
         ctx_proj = prepare_context_ttnn(to_dev(target_hidden, d), cw, d)
         t0 = time.time()
         _, cache = draft_fwd_cached(noise_dev_c, ctx_proj, cw, d, None)
         ttnn.synchronize_device(d)
         print(f"  Cache populated in {time.time()-t0:.1f}s")
-        print(f"  Cache size: {cache[0]['k'].shape[2]} rows/layer")
+        print(f"  Cache K/V rows: {cache[0]['k'].shape[2]} (ctx+noise)")
 
-        # Subsequent calls: small incremental update
+        # Crop: simulate accepting 3 of 16 noise tokens
+        real_pos = ctx_len + new_accepted + 1  # accepted + target correction
+        cache_rows = _tile_pad(real_pos)
+        cache = crop_cache(cache, cache_rows)
+        ttnn.synchronize_device(d)
+        print(f"  After crop: {cache_rows} rows (real_pos={real_pos})")
+
+        # Subsequent calls: small incremental update with crop
         new_ctx_dev = prepare_context_ttnn(
             to_dev(new_ctx_data, d), cw, d)
-        cache_len = cache[0]["k"].shape[2]
-        setup_rope_tables_cached(cw, cache_len, new_ctx_sp, d)
+        setup_rope_tables_cached(cw, cache_rows, new_ctx_sp, d,
+                                 q_start=real_pos + new_accepted)
         sc = prealloc_cached_scratch(new_ctx_sp + SP, d)
 
-        print(f"  Cached forward (new_ctx={new_ctx_sp}, cache={cache_len})...")
+        print(f"  Cached forward (new_ctx={new_ctx_sp}, cache={cache_rows})...")
         n_warmup_c = 2
         n_timed_c = 5
 
         for _ in range(n_warmup_c):
             noise_dev_c = to_dev(noise_bf, d)
-            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
+            _, tmp_cache = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
             ttnn.synchronize_device(d)
 
         t0 = time.perf_counter()
         for _ in range(n_timed_c):
             noise_dev_c = to_dev(noise_bf, d)
-            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
+            _, tmp_cache = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
             ttnn.synchronize_device(d)
         elapsed_c = time.perf_counter() - t0
         per_fwd_c = elapsed_c / n_timed_c * 1000

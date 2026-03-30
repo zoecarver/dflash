@@ -120,8 +120,8 @@ def load_draft_weights(d):
 
     # RoPE tables and support tensors
     freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
-    # Sized for max expected kv_sp; will be sliced if ctx changes
-    max_seq = 256
+    # Sized for max expected position; cached forward grows with each step
+    max_seq = 512
     pos = torch.arange(max_seq, dtype=torch.float32)
     angles = torch.outer(pos, freqs)
     cos_full = torch.cos(angles).to(torch.bfloat16).repeat(1, 2)[:, :HDIM]
@@ -396,22 +396,30 @@ def prealloc_cached_scratch(new_kv_sp, d):
     }
 
 
-def setup_rope_tables_cached(w, cache_len, new_ctx_sp, d):
-    """RoPE tables and softmax kernel for cached forward.
+def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None):
+    """RoPE tables for cached forward.
 
-    cache_len: rows already in cache (tile-aligned)
+    cache_rows: tile-padded rows in cache tensor
     new_ctx_sp: tile-padded new context rows
-    Cached K already has RoPE applied for positions 0..cache_len-1.
+    q_start: actual position of noise tokens (default: cache_rows + new_ctx_sp).
+             Use this when cache_rows includes tile padding beyond the real
+             sequence length, so noise K and Q get matching RoPE positions.
     """
     new_kv_sp = new_ctx_sp + SP
-    total_ctx = cache_len + new_ctx_sp
-    total_kv = cache_len + new_kv_sp
-    w["rope_cos_q"] = to_dev(w["rope_cos_full"][total_ctx:total_ctx + SP], d)
-    w["rope_sin_q"] = to_dev(w["rope_sin_full"][total_ctx:total_ctx + SP], d)
-    w["rope_cos_new_kv"] = to_dev(w["rope_cos_full"][cache_len:cache_len + new_kv_sp], d)
-    w["rope_sin_new_kv"] = to_dev(w["rope_sin_full"][cache_len:cache_len + new_kv_sp], d)
+    if q_start is None:
+        q_start = cache_rows + new_ctx_sp
+    # Q positions: noise tokens at their real positions
+    w["rope_cos_q"] = to_dev(w["rope_cos_full"][q_start:q_start + SP], d)
+    w["rope_sin_q"] = to_dev(w["rope_sin_full"][q_start:q_start + SP], d)
+    # New KV: context starts after cache, noise matches Q positions
+    kv_cos = torch.cat([w["rope_cos_full"][cache_rows:cache_rows + new_ctx_sp],
+                        w["rope_cos_full"][q_start:q_start + SP]], dim=0)
+    kv_sin = torch.cat([w["rope_sin_full"][cache_rows:cache_rows + new_ctx_sp],
+                        w["rope_sin_full"][q_start:q_start + SP]], dim=0)
+    w["rope_cos_new_kv"] = to_dev(kv_cos, d)
+    w["rope_sin_new_kv"] = to_dev(kv_sin, d)
     w["new_kv_sp"] = new_kv_sp
-    w["total_kv"] = total_kv
+    w["total_kv"] = cache_rows + new_kv_sp
 
 
 def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
@@ -523,12 +531,8 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         h = ttnn.add(h, down)
 
-    # Cache update: slice context portion from full K/V (already built for SDPA)
-    ctx_end = cache_len + new_ctx_sp
-    updated = {
-        "k": ttnn.slice(k4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
-        "v": ttnn.slice(v4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
-    }
+    # Cache all K/V (context + noise); caller crops after acceptance
+    updated = {"k": k4, "v": v4}
 
     return h, updated
 
@@ -555,3 +559,18 @@ def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
         return out, new_cache
     else:
         return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS), new_cache
+
+
+def crop_cache(cache, keep_rows):
+    """Crop KV cache to keep_rows (must be tile-aligned).
+
+    Called after acceptance to remove rejected noise K/V.
+    Keeps context + accepted noise, discards rejected noise positions.
+    """
+    return [
+        {
+            "k": ttnn.slice(lc["k"], [0, 0, 0, 0], [1, NKVH, keep_rows, HDIM]),
+            "v": ttnn.slice(lc["v"], [0, 0, 0, 0], [1, NKVH, keep_rows, HDIM]),
+        }
+        for lc in cache
+    ]
