@@ -562,10 +562,11 @@ def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
 
 
 def crop_cache(cache, keep_rows):
-    """Crop KV cache to keep_rows (must be tile-aligned).
+    """Crop KV cache to keep_rows.
 
     Called after acceptance to remove rejected noise K/V.
     Keeps context + accepted noise, discards rejected noise positions.
+    keep_rows need not be tile-aligned; TTNN handles internal tile padding.
     """
     return [
         {

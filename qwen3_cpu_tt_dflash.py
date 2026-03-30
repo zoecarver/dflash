@@ -138,7 +138,9 @@ def main():
             ahist.append(acc + 1)
 
             # === Device: crop cache + prepare new context ===
-            cache_rows = _tile_pad(start)
+            # Crop to exact start (not tile-padded) so cache accumulates properly.
+            # At small scales, _tile_pad(start) <= ctx_sp which discards new data.
+            cache_rows = start
             cache = crop_cache(cache, cache_rows)
 
             # Only extract NEW context (accepted positions from this step)
