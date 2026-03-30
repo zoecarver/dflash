@@ -17,7 +17,9 @@ from device import (
 )
 import dflash_draft
 from dflash_draft import (
-    load_draft_weights, draft_fwd_ttnn, prepare_context_ttnn, setup_rope_tables,
+    load_draft_weights, draft_fwd_ttnn, draft_fwd_cached,
+    prepare_context_ttnn, setup_rope_tables, setup_rope_tables_cached,
+    crop_cache, prealloc_cached_scratch,
     to_dev as draft_to_dev,
     BSIZE, TLAYER_IDS, MASK_ID, SP, N_CTX_LAYERS,
     _tile_pad,
@@ -83,13 +85,16 @@ def main():
         # === Device: prepare initial context from CPU hidden states ===
         ctx_cpu = extract_context_feature(
             cpu_out.hidden_states, TLAYER_IDS
-        ).squeeze(0).to(torch.bfloat16)  # (pl, 5*HIDDEN)
-        ctx_sp = _tile_pad(pl)
-        if ctx_sp > pl:
-            pad = ctx_cpu[-1:].expand(ctx_sp - pl, -1)
+        ).squeeze(0)[:pl].to(torch.bfloat16)  # (pl, 5*HIDDEN)
+        new_ctx_sp = _tile_pad(pl)
+        if new_ctx_sp > pl:
+            pad = ctx_cpu[-1:].expand(new_ctx_sp - pl, -1)
             ctx_cpu = torch.cat([ctx_cpu, pad], dim=0)
-        ctx = prepare_context_ttnn(rep(ctx_cpu, d), dw, d)
-        setup_rope_tables(dw, ctx_sp, d, q_start=pl)
+        new_ctx_dev = prepare_context_ttnn(rep(ctx_cpu, d), dw, d)
+
+        # KV cache state
+        cache = None
+        cache_rows = 0
 
         start = pl
         gen = 0
@@ -100,13 +105,16 @@ def main():
             ts = time.time()
             bids = out[start:start + BSIZE].clone()
 
-            # === Device: embed, draft forward, lm_head, argmax ===
+            # === Device: embed, cached draft forward, lm_head, argmax ===
+            setup_rope_tables_cached(dw, cache_rows, new_ctx_sp, d,
+                                     q_start=start)
             noise = _p(emb_weight[bids])
             if noise.shape[0] < SP:
                 noise = F.pad(noise, (0, 0, 0, SP - noise.shape[0]))
             noise_dev = draft_to_dev(noise, d)
 
-            dout = draft_fwd_ttnn(noise_dev, ctx, dw, d)
+            dout, cache = draft_fwd_cached(
+                noise_dev, new_ctx_dev, dw, d, cache)
             dl = ttnn.matmul(dout, dw["lm_head_rep"])
             # Argmax on device, readback just the token IDs
             draft_tokens = ttnn.argmax(dl, dim=-1)
@@ -124,20 +132,25 @@ def main():
             acc = (bids[1:] == post[:-1]).to(torch.int64).cumprod(0).sum().item()
             out[start:start+acc+1] = bids[:acc+1]
             out[start+acc+1] = post[acc]
+            old_start = start
             start += acc + 1
             gen += acc + 1
             ahist.append(acc + 1)
 
-            # === Device: update context from CPU hidden states ===
-            new_ctx = extract_context_feature(
+            # === Device: crop cache + prepare new context ===
+            cache_rows = _tile_pad(start)
+            cache = crop_cache(cache, cache_rows)
+
+            # Only extract NEW context (accepted positions from this step)
+            new_ctx_cpu = extract_context_feature(
                 cpu_vout.hidden_states, TLAYER_IDS
-            ).squeeze(0)[:start].to(torch.bfloat16)
-            ctx_sp = _tile_pad(start)
-            if ctx_sp > start:
-                pad = new_ctx[-1:].expand(ctx_sp - start, -1)
-                new_ctx = torch.cat([new_ctx, pad], dim=0)
-            ctx = prepare_context_ttnn(rep(new_ctx, d), dw, d)
-            setup_rope_tables(dw, ctx_sp, d, q_start=start)
+            ).squeeze(0)[old_start:old_start + acc + 1].to(torch.bfloat16)
+            new_ctx_real = acc + 1
+            new_ctx_sp = _tile_pad(new_ctx_real)
+            if new_ctx_sp > new_ctx_real:
+                pad = new_ctx_cpu[-1:].expand(new_ctx_sp - new_ctx_real, -1)
+                new_ctx_cpu = torch.cat([new_ctx_cpu, pad], dim=0)
+            new_ctx_dev = prepare_context_ttnn(rep(new_ctx_cpu, d), dw, d)
 
             el = time.time() - ts
             avg = sum(ahist) / len(ahist)
