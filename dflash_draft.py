@@ -433,13 +433,11 @@ def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None,
                              new_ctx_real=None):
     """RoPE tables for cached forward.
 
-    cache_rows: rows in cache tensor (exact, post-crop)
+    cache_rows: exact rows in cache (non-tile-aligned OK)
     new_ctx_sp: tile-padded new context rows
     q_start: actual position of noise tokens (default: cache_rows + new_ctx_sp).
-             Use this when cache_rows includes tile padding beyond the real
-             sequence length, so noise K and Q get matching RoPE positions.
     new_ctx_real: real (unpadded) new context length. When provided, builds an
-                  attention mask to ignore tile-padding in SDPA.
+                  attention mask and stores the real count for cache slicing.
     """
     new_kv_sp = new_ctx_sp + SP
     if q_start is None:
@@ -456,7 +454,9 @@ def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None,
     w["rope_sin_new_kv"] = to_dev(kv_sin, d)
     w["new_kv_sp"] = new_kv_sp
     w["total_kv"] = cache_rows + new_kv_sp
-    # Attention mask: cache rows are all real (exact crop), new has padding
+    # Store real context count for cache slicing in CACHE_NOISE=False path
+    w["new_ctx_real"] = new_ctx_real if new_ctx_real is not None else new_ctx_sp
+    # Attention mask: cache rows are all real (exact), new has padding
     if new_ctx_real is not None:
         total_kv = cache_rows + new_kv_sp
         new_kv_offset = cache_rows
@@ -581,12 +581,13 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         h = ttnn.add(h, down)
 
-    # Cache K/V; caller crops after acceptance
+    # Cache K/V; reference model only caches context (not noise)
     if CACHE_NOISE:
         updated = {"k": k4, "v": v4}
     else:
-        # Context-only: slice off noise rows
-        ctx_end = (layer_cache["k"].shape[2] if layer_cache is not None else 0) + new_ctx.shape[0]
+        # Context-only: keep exact real context rows, exclude noise and padding
+        new_ctx_real_count = w.get("new_ctx_real", new_ctx.shape[0])
+        ctx_end = cache_len + new_ctx_real_count
         updated = {
             "k": ttnn.slice(k4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
             "v": ttnn.slice(v4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),

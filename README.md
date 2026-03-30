@@ -42,7 +42,7 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
   │   │  SDPA (non-causal, GQA) │    │                                  │
   │   │  O proj + residual      │    │                                  │
   │   │  MLP + residual         │    │                                  │
-  │   │  KV cache (grow+crop)   │    │                                  │
+  │   │  KV cache (ctx only)    │    │                                  │
   │   └──────────┬──────────────┘    │                                  │
   │              ▼                   │                                  │
   │   RMSNorm → lm_head → argmax     │                                  │
@@ -60,14 +60,14 @@ In a standard transformer, the KV cache stores keys/values from previous tokens 
 DFlash's KV cache differs in two ways:
 
 1. **K/V come from two sources**: context (target hidden states projected through k/v_proj) and noise (draft token embeddings through k/v_proj). Both are concatenated before attention.
-2. **Grow-then-crop**: each step appends K/V for all new positions (new context + 16 noise), then crops after accept/reject to remove rejected noise. The net cache growth per step is `acceptance_length + 1`.
+2. **Context-only caching**: the cache only stores context K/V. Noise K/V is computed fresh each step for SDPA but never persisted. After acceptance, the accepted tokens' K/V are re-computed as new context (from target hidden states) on the next step.
 
 The cache stores post-QKnorm + post-RoPE K and raw V. Each step:
-- Compute K/V for new context + noise only (not the full history)
+- Compute K/V for new context + noise (not the full history)
 - Concat cached K/V with new K/V for SDPA
-- After accept/reject, crop cache to keep context + accepted noise positions
+- Store only the context portion of new K/V in the cache (exclude noise)
 
-This matches the reference implementation which uses `DynamicCache.update()` to append all K/V, then `DynamicCache.crop(start)` to discard rejected positions.
+This matches the reference implementation which uses `DynamicCache.update()` to append all K/V, then `DynamicCache.crop(start)` to discard noise positions. Net cache growth per step is `acceptance_length + 1`.
 
 ## Op mapping: TT-Lang vs TTNN
 
@@ -120,30 +120,31 @@ CPU Qwen3 (stock `transformers`) for prefill/verify. DFlash entirely on Tenstorr
 
 Profiled standalone DFlash forward (no host transfers). Non-cached recomputes K/V projections, QK-norm, and RoPE for the entire context every step. Cached stores post-RoPE K and raw V, only computing new rows each step.
 
-| Context length | Non-cached | Cached (ctx only) | Cached (ctx+noise) |
+| Context length | Non-cached (acc 5.3) | Cached ctx+noise (acc 3.2) | Cached ctx only (acc 5.8) |
 |---|---|---|---|
 | 64 | 7.9ms | -- | -- |
-| 120k | 887ms | 93ms | 80ms |
-| 250k | 1727ms | 180ms | 158ms |
+| 120k | 892ms | 80ms | 145ms |
+| 250k | 1776ms | 158ms | 294ms |
 
-Note: current cached forward bottleneck is 2x concat of cached K/V per layer for SDPA input.
+Cached ctx+noise (`CACHE_NOISE=True`) is faster but has degraded acceptance because noise
+K/V (from draft embeddings) differs from context K/V (from target hidden states). Cached
+ctx only (`CACHE_NOISE=False`) matches the reference model and achieves full acceptance rate.
 
 ## Example run
 
 ```
-   step 1: acc=5/16 avg=5.0 1.2s gen=5
-   step 2: acc=1/16 avg=3.0 1.1s gen=6
-   step 3: acc=4/16 avg=3.3 1.1s gen=10
-   step 4: acc=3/16 avg=3.2 1.1s gen=13
-   step 5: acc=1/16 avg=2.8 1.2s gen=14
-   step 6: acc=2/16 avg=2.7 1.2s gen=16
-   step 7: acc=3/16 avg=2.7 2.0s gen=19
-   step 8: acc=3/16 avg=2.8 1.2s gen=22
-   step 9: acc=12/16 avg=3.8 1.3s gen=34
-   step 10: acc=1/16 avg=3.5 1.4s gen=35
-   step 11: acc=8/16 avg=3.9 1.4s gen=43
-   step 12: acc=11/16 avg=4.5 1.4s gen=54
-   step 13: acc=15/16 avg=5.3 2.3s gen=69
+  step 1: acc=5/16 avg=5.0 1.2s gen=5
+  step 2: acc=1/16 avg=3.0 1.1s gen=6
+  step 3: acc=4/16 avg=3.3 1.1s gen=10
+  step 4: acc=3/16 avg=3.2 1.1s gen=13
+  step 5: acc=1/16 avg=2.8 1.1s gen=14
+  step 6: acc=2/16 avg=2.7 1.2s gen=16
+  step 7: acc=3/16 avg=2.7 1.2s gen=19
+  step 8: acc=3/16 avg=2.8 1.2s gen=22
+  step 9: acc=13/16 avg=3.9 1.2s gen=35
+  step 10: acc=8/16 avg=4.3 1.4s gen=43
+  step 11: acc=11/16 avg=4.9 1.4s gen=54
+  step 12: acc=15/16 avg=5.8 1.5s gen=69
 
 --- Output ---
 user
@@ -162,4 +163,5 @@ def fibonacci_recursive(n):
     return 0
 ```
 
-Average acceptance: 5.3 tokens/step, matching the CPU reference. Uses non-cached forward with attention masking to eliminate tile-padding dilution. The cached forward path has lower acceptance (2.3) due to stale data from `ttnn.concat` of sliced cache tensors; see KV cache section for tradeoffs.
+Average acceptance: 5.8 tokens/step, matching the CPU reference. Uses KV-cached forward
+with `CACHE_NOISE=False` (only cache context K/V, not noise -- matching the reference model).

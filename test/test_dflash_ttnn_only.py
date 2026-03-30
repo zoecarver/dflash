@@ -322,11 +322,13 @@ def main():
         print(f"  Cache K/V rows: {cache[0]['k'].shape[2]} (ctx+noise)")
 
         # Crop: simulate accepting 3 of 16 noise tokens
+        # Use exact (non-tile-aligned) row count to avoid stale rejected-noise
+        # K/V rows corrupting subsequent attention
         real_pos = ctx_len + new_accepted + 1  # accepted + target correction
-        cache_rows = _tile_pad(real_pos)
+        cache_rows = real_pos  # exact, not tile-padded
         cache = crop_cache(cache, cache_rows)
         ttnn.synchronize_device(d)
-        print(f"  After crop: {cache_rows} rows (real_pos={real_pos})")
+        print(f"  After crop: {cache_rows} rows (exact)")
 
         # Subsequent calls: small incremental update with crop
         new_ctx_dev = prepare_context_ttnn(

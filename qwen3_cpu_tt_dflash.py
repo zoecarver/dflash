@@ -3,6 +3,11 @@
 CPU Qwen3 (transformers) produces logits and hidden states — stock model,
 nothing custom. Everything DFlash-related runs on Tenstorrent: context
 projection, 8-layer draft forward, lm_head, argmax.
+
+Uses KV-cached draft forward: cache stores post-QKnorm+RoPE K and raw V.
+Each step only computes K/V for new context + noise, then concats with cache.
+Cache is cropped to exact (non-tile-aligned) row count after acceptance to
+avoid stale rejected-noise rows corrupting subsequent attention.
 """
 import time
 import torch
@@ -17,8 +22,8 @@ from device import (
 )
 import dflash_draft
 from dflash_draft import (
-    load_draft_weights, draft_fwd_ttnn,
-    prepare_context_ttnn, setup_rope_tables,
+    load_draft_weights, draft_fwd_cached, draft_fwd_ttnn,
+    prepare_context_ttnn, setup_rope_tables, setup_rope_tables_cached,
     to_dev as draft_to_dev,
     BSIZE, TLAYER_IDS, MASK_ID, SP, N_CTX_LAYERS,
     _tile_pad,
@@ -31,6 +36,8 @@ USE_TTLANG = True
 dflash_draft.TTLANG_ENABLED = USE_TTLANG
 # TT-Lang rmsnorm has ~0.63x magnitude bug on mesh -- enable to test the flow
 dflash_draft.TTLANG_RMSNORM = False
+# Match reference model: only cache context K/V, not noise
+dflash_draft.CACHE_NOISE = False
 
 
 def extract_context_feature(hidden_states, layer_ids):
@@ -81,35 +88,54 @@ def main():
         out[:pl] = input_ids[0]
         out[pl] = torch.argmax(cpu_out.logits[0, -1, :].float()).item()
 
-        # === Accumulated context on host (re-projected each step) ===
-        all_ctx_cpu = extract_context_feature(
+        # === Initial context for first draft forward ===
+        init_ctx_cpu = extract_context_feature(
             cpu_out.hidden_states, TLAYER_IDS
         ).squeeze(0)[:pl].to(torch.bfloat16)
+
+        # Project and norm initial context on device
+        init_ctx_sp = _tile_pad(pl)
+        init_ctx_padded = init_ctx_cpu
+        if init_ctx_sp > pl:
+            init_ctx_padded = F.pad(init_ctx_cpu, (0, 0, 0, init_ctx_sp - pl))
+        init_ctx_dev = prepare_context_ttnn(rep(init_ctx_padded, d), dw, d)
 
         start = pl
         gen = 0
         ahist = []
+        cache = None
+        cache_rows = 0  # exact (non-tile-aligned) rows in cache
 
         print("\nDecoding...")
         while start < pl + 64:
             ts = time.time()
             bids = out[start:start + BSIZE].clone()
 
-            # === Device: non-cached forward with full context ===
-            ctx_sp = _tile_pad(all_ctx_cpu.shape[0])
-            ctx_padded = all_ctx_cpu
-            if ctx_sp > all_ctx_cpu.shape[0]:
-                ctx_padded = F.pad(all_ctx_cpu, (0, 0, 0, ctx_sp - all_ctx_cpu.shape[0]))
-            ctx = prepare_context_ttnn(rep(ctx_padded, d), dw, d)
-            setup_rope_tables(dw, ctx_sp, d, q_start=start,
-                              ctx_real=all_ctx_cpu.shape[0])
+            # === Device: cached forward ===
+            if cache is None:
+                # First step: full context as "new context", empty cache
+                new_ctx_dev = init_ctx_dev
+                new_ctx_sp = init_ctx_sp
+                new_ctx_real = pl
+            else:
+                # Subsequent steps: only newly accepted context
+                new_ctx_sp = _tile_pad(new_ctx_real)
+                new_ctx_padded = new_ctx_cpu
+                if new_ctx_sp > new_ctx_real:
+                    new_ctx_padded = F.pad(new_ctx_cpu,
+                                           (0, 0, 0, new_ctx_sp - new_ctx_real))
+                new_ctx_dev = prepare_context_ttnn(rep(new_ctx_padded, d), dw, d)
+
+            setup_rope_tables_cached(dw, cache_rows, new_ctx_sp, d,
+                                     q_start=start,
+                                     new_ctx_real=new_ctx_real)
 
             noise = _p(emb_weight[bids])
             if noise.shape[0] < SP:
                 noise = F.pad(noise, (0, 0, 0, SP - noise.shape[0]))
             noise_dev = draft_to_dev(noise, d)
 
-            dout = draft_fwd_ttnn(noise_dev, ctx, dw, d)
+            dout, cache = draft_fwd_cached(noise_dev, new_ctx_dev, dw, d, cache)
             dl = ttnn.matmul(dout, dw["lm_head_rep"])
             draft_tokens = ttnn.argmax(dl, dim=-1)
             draft_ids = rb(draft_tokens)[:BSIZE].long().squeeze(-1)
@@ -131,11 +157,14 @@ def main():
             gen += acc + 1
             ahist.append(acc + 1)
 
-            # Update accumulated context from verification
-            new_ctx = extract_context_feature(
+            # Cache already excludes noise (CACHE_NOISE=False), just track size
+            cache_rows += new_ctx_real
+
+            # Extract new context from verification for next step
+            new_ctx_cpu = extract_context_feature(
                 cpu_vout.hidden_states, TLAYER_IDS
             ).squeeze(0)[old_start:old_start + acc + 1].to(torch.bfloat16)
-            all_ctx_cpu = torch.cat([all_ctx_cpu, new_ctx], dim=0)
+            new_ctx_real = acc + 1
 
             el = time.time() - ts
             avg = sum(ahist) / len(ahist)
