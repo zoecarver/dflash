@@ -18,10 +18,10 @@ from qwen3 import (
     prealloc_scratch,
 )
 from dflash_draft import (
-    load_draft_weights, draft_fwd, prepare_context, setup_rope_tables,
+    load_draft_weights, draft_fwd_ttnn, prepare_context_ttnn, setup_rope_tables,
     to_dev as draft_to_dev,
     BSIZE, TLAYER_IDS, MASK_ID, SP, N_CTX_LAYERS,
-    _tile_pad, norm_k,
+    _tile_pad,
 )
 
 TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
@@ -61,10 +61,16 @@ def spec_generate(ids, w, d, max_new=64):
     lh = rb_dim1(logits)[:pl, :VOCAB].float()
     out[pl] = torch.argmax(lh[-1]).item()
 
-    # Build draft context from target hidden states (all on device)
-    tf_dev = ttnn.concat([ths[lid] for lid in TLAYER_IDS], dim=-1)
-    ctx = prepare_context(tf_dev, w, d)
-    setup_rope_tables(w, sp, d)  # sp = tile-padded context rows
+    # Build draft context from target hidden states
+    # Readback to fix padding: replace zero-padded rows with last valid row
+    tf_slices = [rb(ths[lid])[:pl, :HIDDEN] for lid in TLAYER_IDS]
+    tf_host = torch.cat(tf_slices, dim=-1)  # (pl, 5*HIDDEN)
+    if sp > pl:
+        pad_rows = tf_host[-1:].expand(sp - pl, -1)
+        tf_host = torch.cat([tf_host, pad_rows], dim=0)
+    tf_dev = rep(tf_host, d)
+    ctx = prepare_context_ttnn(tf_dev, w, d)
+    setup_rope_tables(w, sp, d, q_start=pl)
 
     start = pl
     gen = 0
@@ -80,10 +86,10 @@ def spec_generate(ids, w, d, max_new=64):
         noise_dev = draft_to_dev(noise, d)
 
         # Draft: propose BSIZE tokens
-        dout = draft_fwd(noise_dev, ctx, w, d)
+        dout = draft_fwd_ttnn(noise_dev, ctx, w, d)
         dl = ttnn.matmul(dout, w["lm_head"])
         dlh = rb_dim1(dl)[:BSIZE, :VOCAB].float()
-        bids[1:] = torch.argmax(dlh[:-1], dim=-1)
+        bids[1:] = torch.argmax(dlh[1:BSIZE], dim=-1)
 
         # Target: verify full context
         verify_ids = torch.cat([out[:start], bids])
@@ -102,6 +108,18 @@ def spec_generate(ids, w, d, max_new=64):
         vlh = rb_dim1(vl)[start:start + BSIZE, :VOCAB].float()
         post = torch.argmax(vlh, dim=-1)
 
+        if len(ahist) < 5:
+            matches = (bids[1:] == post[:-1]).tolist()
+            n_match = sum(matches)
+            print(f"    match: {n_match}/15  bids[1:]={bids[1:6].tolist()} post[:-1]={post[:5].tolist()}")
+            for pos in range(min(5, BSIZE - 1)):
+                dtok = torch.argmax(dlh[pos + 1]).item()
+                ttok = post[pos].item()
+                d5 = torch.topk(dlh[pos + 1], 5).indices.tolist()
+                t5 = torch.topk(vlh[pos], 5).indices.tolist()
+                overlap = len(set(d5) & set(t5))
+                print(f"    pos {pos}: d={dtok} t={ttok} {'✓' if dtok==ttok else '✗'} top5ovlp={overlap}/5")
+
         # Accept/reject
         acc = (bids[1:] == post[:-1]).to(torch.int64).cumprod(0).sum().item()
         out[start:start+acc+1] = bids[:acc+1]
@@ -110,10 +128,17 @@ def spec_generate(ids, w, d, max_new=64):
         gen += acc + 1
         ahist.append(acc + 1)
 
-        # Update draft context from verify hidden states (all on device)
-        vf_dev = ttnn.concat([vhs[lid] for lid in TLAYER_IDS], dim=-1)
-        ctx = prepare_context(vf_dev, w, d)
-        setup_rope_tables(w, vsp, d)  # vsp = tile-padded verify context rows
+        # Update draft context: only accepted positions (0..start-1)
+        ctx_sp = ((start + TILE - 1) // TILE) * TILE
+        vf_slices = [rb(vhs[lid])[:start, :HIDDEN] for lid in TLAYER_IDS]
+        vf_host = torch.cat(vf_slices, dim=-1)  # (start, 5*HIDDEN)
+        # Pad by repeating last row (not zeros) to avoid softmax leaking to padding
+        if ctx_sp > start:
+            pad_rows = vf_host[-1:].expand(ctx_sp - start, -1)
+            vf_host = torch.cat([vf_host, pad_rows], dim=0)
+        vf_dev = rep(vf_host, d)
+        ctx = prepare_context_ttnn(vf_dev, w, d)
+        setup_rope_tables(w, ctx_sp, d, q_start=start)
 
         el = time.time() - ts
         avg = sum(ahist) / len(ahist)

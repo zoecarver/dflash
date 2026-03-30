@@ -76,11 +76,18 @@ def load_draft_weights(d):
     print("Loading draft weights...")
     w = {}
     with safe_open(f"{DRAFT_DIR}/model.safetensors", framework="pt") as f:
-        w["fc_w"] = to_dev(f.get_tensor("fc.weight").T.contiguous().to(torch.bfloat16), d)
+        fc_full = f.get_tensor("fc.weight").T.contiguous().to(torch.bfloat16)  # (10240, 2048)
+        w["fc_w"] = to_dev(fc_full, d)
+        # Split FC into per-layer chunks for higher precision accumulation
+        for ci in range(N_CTX_LAYERS):
+            chunk = fc_full[ci * HIDDEN:(ci + 1) * HIDDEN, :]  # (2048, 2048)
+            w[f"fc_w.{ci}"] = to_dev(chunk, d)
         hn_w = f.get_tensor("hidden_norm.weight").to(torch.bfloat16)
         w["hn_w_tt"] = to_dev(hn_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        w["hn_w"] = to_dev(hn_w.unsqueeze(0), d)
         fn_w = f.get_tensor("norm.weight").to(torch.bfloat16)
         w["fn_w_tt"] = to_dev(fn_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        w["fn_w"] = to_dev(fn_w.unsqueeze(0), d)
 
         for li in range(DLAYERS):
             dp = f"layers.{li}"
@@ -88,6 +95,8 @@ def load_draft_weights(d):
             pa_w = f.get_tensor(f"{dp}.post_attention_layernorm.weight").to(torch.bfloat16)
             w[f"in_w_tt.{li}"] = to_dev(in_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
             w[f"pa_w_tt.{li}"] = to_dev(pa_w.unsqueeze(0).expand(TILE, -1).contiguous(), d)
+            w[f"in_w.{li}"] = to_dev(in_w.unsqueeze(0), d)
+            w[f"pa_w.{li}"] = to_dev(pa_w.unsqueeze(0), d)
             w[f"qw.{li}"] = to_dev(f.get_tensor(f"{dp}.self_attn.q_proj.weight").T.contiguous().to(torch.bfloat16), d)
             w[f"kw.{li}"] = to_dev(f.get_tensor(f"{dp}.self_attn.k_proj.weight").T.contiguous().to(torch.bfloat16), d)
             w[f"vw.{li}"] = to_dev(f.get_tensor(f"{dp}.self_attn.v_proj.weight").T.contiguous().to(torch.bfloat16), d)
@@ -120,16 +129,27 @@ def load_draft_weights(d):
     return w
 
 
-def setup_rope_tables(w, ctx_sp, d):
+def setup_rope_tables(w, ctx_sp, d, q_start=None):
     """Upload RoPE tables sized for a given tile-padded context length.
 
     ctx_sp: tile-padded context rows. kv_sp = ctx_sp + SP (context + draft).
+    q_start: actual start position for Q/noise tokens (default: ctx_sp).
+             When ctx_sp > q_start due to tile padding, this corrects the RoPE
+             positions so noise tokens get their true positions.
     """
+    if q_start is None:
+        q_start = ctx_sp
     kv_sp = ctx_sp + SP
-    w["rope_cos_q"] = to_dev(w["rope_cos_full"][ctx_sp:ctx_sp + SP], d)
-    w["rope_sin_q"] = to_dev(w["rope_sin_full"][ctx_sp:ctx_sp + SP], d)
-    w["rope_cos_kv"] = to_dev(w["rope_cos_full"][:kv_sp], d)
-    w["rope_sin_kv"] = to_dev(w["rope_sin_full"][:kv_sp], d)
+    # Q: actual positions q_start..q_start+SP-1
+    w["rope_cos_q"] = to_dev(w["rope_cos_full"][q_start:q_start + SP], d)
+    w["rope_sin_q"] = to_dev(w["rope_sin_full"][q_start:q_start + SP], d)
+    # KV: context positions 0..ctx_sp-1, noise positions q_start..q_start+SP-1
+    kv_cos = torch.cat([w["rope_cos_full"][:ctx_sp],
+                        w["rope_cos_full"][q_start:q_start + SP]], dim=0)
+    kv_sin = torch.cat([w["rope_sin_full"][:ctx_sp],
+                        w["rope_sin_full"][q_start:q_start + SP]], dim=0)
+    w["rope_cos_kv"] = to_dev(kv_cos, d)
+    w["rope_sin_kv"] = to_dev(kv_sin, d)
     w["kv_sp"] = kv_sp
     total_q_rows = NKVH * GQA * SP
     w["softmax_k"] = make_softmax_kernel(total_q_rows // TILE, kv_sp // TILE)
@@ -228,3 +248,84 @@ def prepare_context(target_hidden, w, d):
     ctx_norm = to_dev(torch.zeros(ctx_sp, HIDDEN), d)
     norm_k(ctx_proj, w["hn_w_tt"], w["sc"], w["ms"], ctx_norm)
     return ctx_norm
+
+
+# ---------------------------------------------------------------------------
+# TTNN-only forward (for mesh devices where TT-Lang has scaling issues)
+# ---------------------------------------------------------------------------
+def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
+    """Single layer forward using TTNN ops only (no TT-Lang kernels)."""
+    scale = 1.0 / (HDIM ** 0.5)
+    kv_sp = w["kv_sp"]
+
+    normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
+
+    q = ttnn.matmul(normed, w[f"qw.{li}"])
+    kv_in = ttnn.concat([ctx_dev, normed], dim=0)
+    k = ttnn.matmul(kv_in, w[f"kw.{li}"])
+    v = ttnn.matmul(kv_in, w[f"vw.{li}"])
+
+    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
+    k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
+    q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
+    k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
+    q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
+    k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
+
+    # TT-Lang rope (element-wise, no reduction -- works on mesh)
+    q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+    q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
+    k_rope_k(k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
+
+    q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
+    q_grouped = ttnn.reshape(q4, (1, NKVH, GQA * SP, HDIM))
+    k_t = ttnn.transpose(k4, -2, -1)
+    scores = ttnn.matmul(q_grouped, k_t)
+    scores = ttnn.multiply(scores, scale)
+
+    probs = ttnn.softmax(scores, dim=-1)
+
+    attn_4d = ttnn.matmul(probs, v4)
+    attn_heads = ttnn.reshape(attn_4d, (1, NQH, SP, HDIM))
+    attn_flat = ttnn.reshape(ttnn.transpose(attn_heads, 1, 2), (SP, NQH * HDIM))
+
+    o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
+    h = ttnn.add(h, o)
+
+    normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
+
+    gate = ttnn.matmul(normed2, w[f"gw.{li}"])
+    up = ttnn.matmul(normed2, w[f"uw.{li}"])
+    act = ttnn.mul(ttnn.silu(gate), up)
+    down = ttnn.matmul(act, w[f"fc2.{li}"])
+
+    return ttnn.add(h, down)
+
+
+def draft_fwd_ttnn(noise, ctx, w, d):
+    """Full 8-layer draft forward using TTNN ops only."""
+    h = noise
+    for li in range(DLAYERS):
+        h = draft_layer_fwd_ttnn(h, ctx, w, li, d)
+    return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS)
+
+
+def prepare_context_ttnn(target_hidden, w, d):
+    """FC projection + hidden norm using TTNN ops only.
+
+    Splits the 10240->2048 FC into 5 x 2048->2048 matmuls to reduce
+    bf16 accumulation error (inner dim 2048 vs 10240).
+    """
+    ctx_sp = target_hidden.shape[0]
+    # Split target_hidden along feature dim, project each chunk separately
+    parts = []
+    for ci in range(N_CTX_LAYERS):
+        sl = ttnn.slice(target_hidden, [0, ci * HIDDEN], [ctx_sp, (ci + 1) * HIDDEN])
+        parts.append(ttnn.matmul(sl, w[f"fc_w.{ci}"]))
+    ctx_proj = parts[0]
+    for p in parts[1:]:
+        ctx_proj = ttnn.add(ctx_proj, p)
+    return ttnn.rms_norm(ctx_proj, weight=w["hn_w"], epsilon=EPS)
