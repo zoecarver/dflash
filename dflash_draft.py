@@ -398,3 +398,162 @@ def prepare_context_ttnn(target_hidden, w, d):
         return ctx_norm
     else:
         return ttnn.rms_norm(ctx_proj, weight=w["hn_w"], epsilon=EPS)
+
+
+# ---------------------------------------------------------------------------
+# KV-cached forward
+# ---------------------------------------------------------------------------
+def setup_rope_tables_cached(w, cache_len, new_ctx_sp, d):
+    """RoPE tables and softmax kernel for cached forward.
+
+    cache_len: rows already in cache (tile-aligned)
+    new_ctx_sp: tile-padded new context rows
+    Cached K already has RoPE applied for positions 0..cache_len-1.
+    """
+    new_kv_sp = new_ctx_sp + SP
+    total_ctx = cache_len + new_ctx_sp
+    total_kv = cache_len + new_kv_sp
+    w["rope_cos_q"] = to_dev(w["rope_cos_full"][total_ctx:total_ctx + SP], d)
+    w["rope_sin_q"] = to_dev(w["rope_sin_full"][total_ctx:total_ctx + SP], d)
+    w["rope_cos_new_kv"] = to_dev(w["rope_cos_full"][cache_len:cache_len + new_kv_sp], d)
+    w["rope_sin_new_kv"] = to_dev(w["rope_sin_full"][cache_len:cache_len + new_kv_sp], d)
+    w["new_kv_sp"] = new_kv_sp
+    w["total_kv"] = total_kv
+
+
+def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache):
+    """Single layer forward with KV cache.
+
+    h: noise hidden states (SP, HIDDEN)
+    new_ctx: new context rows (new_ctx_sp, HIDDEN), already projected+normed
+    layer_cache: {"k": (cache_len, NKVH*HDIM), "v": same} or None
+    Returns: (h_out, updated_layer_cache)
+    """
+    new_ctx_sp = new_ctx.shape[0]
+    new_kv_sp = w["new_kv_sp"]
+    total_kv = w["total_kv"]
+
+    # Input RMSNorm
+    if TTLANG_RMSNORM:
+        normed = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
+    else:
+        normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
+
+    # Q from noise only
+    q = ttnn.matmul(normed, w[f"qw.{li}"])
+
+    # K/V from new context + noise only
+    new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
+    new_k = ttnn.matmul(new_kv_in, w[f"kw.{li}"])
+    new_v = ttnn.matmul(new_kv_in, w[f"vw.{li}"])
+
+    # QK-norm
+    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
+    new_k_flat = ttnn.reshape(new_k, (new_kv_sp * NKVH, HDIM))
+
+    if TTLANG_RMSNORM:
+        q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
+        head_norm_k(q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+        new_k_normed_flat = to_dev(torch.zeros(new_kv_sp * NKVH, HDIM), d)
+        head_norm_k(new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
+    else:
+        q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
+        new_k_normed_flat = ttnn.rms_norm(new_k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
+
+    q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
+    new_k_normed = ttnn.reshape(new_k_normed_flat, (new_kv_sp, NKVH * HDIM))
+
+    # RoPE on Q and new K only
+    q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
+    new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
+    k_rope_k(new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
+
+    # Build full K/V: cached + new
+    if layer_cache is not None:
+        full_k = ttnn.concat([layer_cache["k"], new_k_roped], dim=0)
+        full_v = ttnn.concat([layer_cache["v"], new_v], dim=0)
+    else:
+        full_k = new_k_roped
+        full_v = new_v
+
+    # SDPA: fused Q×K^T + scale + softmax + probs×V
+    q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(full_k, (1, total_kv, NKVH, HDIM)), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(full_v, (1, total_kv, NKVH, HDIM)), 1, 2)
+    attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
+    attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
+
+    o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
+
+    # Residual add
+    if TTLANG_ENABLED:
+        h_new = to_dev(torch.zeros(SP, HIDDEN), d)
+        residual_add_kernel(h, o, h_new)
+        h = h_new
+    else:
+        h = ttnn.add(h, o)
+
+    # Post-attention RMSNorm
+    if TTLANG_RMSNORM:
+        normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
+    else:
+        normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
+
+    gate = ttnn.matmul(normed2, w[f"gw.{li}"])
+    up = ttnn.matmul(normed2, w[f"uw.{li}"])
+
+    # SiLU * mul
+    if TTLANG_ENABLED:
+        act = ttnn.zeros_like(gate)
+        silu_mul_kernel(gate, up, act)
+    else:
+        act = ttnn.mul(ttnn.silu(gate), up)
+
+    down = ttnn.matmul(act, w[f"fc2.{li}"])
+
+    # Residual add
+    if TTLANG_ENABLED:
+        h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
+        residual_add_kernel(h, down, h_new2)
+        h = h_new2
+    else:
+        h = ttnn.add(h, down)
+
+    # Update cache: context portion of new K/V (exclude noise at the end)
+    new_ctx_k = ttnn.slice(new_k_roped, [0, 0], [new_ctx_sp, NKVH * HDIM])
+    new_ctx_v = ttnn.slice(new_v, [0, 0], [new_ctx_sp, NKVH * HDIM])
+    if layer_cache is not None:
+        updated = {
+            "k": ttnn.concat([layer_cache["k"], new_ctx_k], dim=0),
+            "v": ttnn.concat([layer_cache["v"], new_ctx_v], dim=0),
+        }
+    else:
+        updated = {"k": new_ctx_k, "v": new_ctx_v}
+
+    return h, updated
+
+
+def draft_fwd_cached(noise, new_ctx, w, d, cache):
+    """8-layer draft forward with KV cache.
+
+    noise: (SP, HIDDEN) noise embedding on device
+    new_ctx: (new_ctx_sp, HIDDEN) new context rows, already projected+normed
+    cache: list of 8 layer caches, or None for first call
+    Returns: (output, updated_cache)
+    """
+    h = noise
+    new_cache = []
+    for li in range(DLAYERS):
+        lc = cache[li] if cache is not None else None
+        h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc)
+        new_cache.append(updated_lc)
+    # Final RMSNorm
+    if TTLANG_RMSNORM:
+        out = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, w["fn_w_tt"], w["sc"], w["ms"], out)
+        return out, new_cache
+    else:
+        return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS), new_cache

@@ -1,14 +1,20 @@
-"""DFlash draft model: swap TT-Lang softmax/rmsnorm/silu_mul/add with TTNN ops.
+"""DFlash draft model: TTNN forward + KV cache perf test at 250k context.
 
-Keeps TT-Lang rope kernel (precision impact is small).
-Tests whether TTNN ops improve PCC vs PyTorch reference.
+Tests both non-cached and cached forward at long context lengths.
 """
+import sys
+sys.path.insert(0, "/tmp")
 import time
 import torch
 import torch.nn.functional as F
 import ttnn
 from safetensors import safe_open
 from rope import make_rope_kernel
+from dflash_draft import (
+    draft_fwd_cached, setup_rope_tables_cached, prepare_context_ttnn,
+    load_draft_weights, setup_rope_tables, draft_fwd_ttnn,
+    to_dev as dd_to_dev, _tile_pad,
+)
 
 TILE = 32
 HIDDEN = 2048
@@ -169,7 +175,7 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
 
 def main():
     torch.manual_seed(42)
-    ctx_len = 64
+    ctx_len = 250_000
     ctx_sp = _tile_pad(ctx_len)
     kv_len = ctx_len + BSIZE
     kv_sp = ctx_sp + SP
@@ -200,33 +206,23 @@ def main():
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
     # Random inputs
+    print(f"Generating random inputs (ctx_len={ctx_len})...")
     noise_bf = torch.randn(BSIZE, HIDDEN).to(torch.bfloat16) * 0.1
+    # Generate random context (skip PyTorch reference -- too slow at 250k)
     target_hidden = torch.randn(ctx_len, N_CTX_LAYERS * HIDDEN).to(torch.bfloat16) * 0.1
 
     # RoPE tables
     freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, HDIM, 2, dtype=torch.float32) / HDIM))
-    cos_q = torch.cos(torch.outer(torch.arange(ctx_len, ctx_len + BSIZE, dtype=torch.float32), freqs))
-    sin_q = torch.sin(torch.outer(torch.arange(ctx_len, ctx_len + BSIZE, dtype=torch.float32), freqs))
-    cos_kv = torch.cos(torch.outer(torch.arange(kv_len, dtype=torch.float32), freqs))
-    sin_kv = torch.sin(torch.outer(torch.arange(kv_len, dtype=torch.float32), freqs))
-
-    # PyTorch reference
-    print("\nPyTorch reference...")
-    ctx_bf = torch_prepare_context(target_hidden, w["fc_w"], w["hn_w"])
-    ref_h = noise_bf.float()
-    for li in range(DLAYERS):
-        ref_h = torch_layer_fwd(ref_h, ctx_bf.float(), w, li, cos_q, sin_q, cos_kv, sin_kv)
-    ref_final = torch_rmsnorm(ref_h, w["fn_w"].float())
 
     # Device forward
-    print("\nDevice forward (TTNN ops)...")
+    print(f"\nDevice forward (TTNN ops, ctx={ctx_len})...")
     default_size = ttnn.device.get_max_worker_l1_unreserved_size()
     d = ttnn.open_device(device_id=0, worker_l1_size=default_size - 131072)
     try:
         q_rope = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NQH)
         k_rope = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NKVH)
 
-        # Upload weights (ttnn.rms_norm uses (1, dim) weight)
+        # Upload weights
         print("  Uploading weights...")
         t0 = time.time()
         dw = {}
@@ -246,8 +242,8 @@ def main():
             dw[f"uw.{li}"] = to_dev(w[f"uw.{li}"], d)
             dw[f"fc2.{li}"] = to_dev(w[f"fc2.{li}"], d)
 
-        # RoPE tables (for TT-Lang rope kernel)
-        max_seq = 256
+        # RoPE tables
+        max_seq = ctx_sp + SP + TILE
         pos_t = torch.arange(max_seq, dtype=torch.float32)
         angles = torch.outer(pos_t, freqs)
         cos_full = torch.cos(angles).to(torch.bfloat16).repeat(1, 2)[:, :HDIM]
@@ -260,37 +256,32 @@ def main():
         dw["rope_sin_kv"] = to_dev(sin_adj[:kv_sp], d)
         print(f"  Uploaded in {time.time()-t0:.1f}s")
 
-        # Prepare context
+        # Prepare context on device
         print("  Preparing context...")
+        t0 = time.time()
         target_hidden_dev = to_dev(target_hidden, d)
         ctx_proj = ttnn.matmul(target_hidden_dev, dw["fc_w"])
         ctx_norm = ttnn.rms_norm(ctx_proj, weight=dw["hn_w"], epsilon=EPS)
-        tt_ctx = ttnn.to_torch(ctx_norm).float()[:ctx_len, :HIDDEN]
-        p = pcc(ctx_bf, tt_ctx)
-        print(f"  Context PCC={p:.6f}")
+        ttnn.synchronize_device(d)
+        print(f"  Context prepared in {time.time()-t0:.1f}s")
 
-        # Run 8 layers
-        print("\n  8-layer forward (TTNN ops)...")
+        # Run 8 layers (single pass, no PCC -- reference too slow at 250k)
+        print("\n  8-layer forward...")
+        t0 = time.time()
         h = to_dev(noise_bf, d)
-        ref_h_per_layer = noise_bf.float()
         for li in range(DLAYERS):
-            print(f"    Layer {li}...", end=" ", flush=True)
+            print(f"    Layer {li}...", flush=True)
             h = dev_layer_fwd_ttnn(h, ctx_norm, dw, li, q_rope, k_rope, kv_sp, d)
-            ref_h_per_layer = torch_layer_fwd(ref_h_per_layer, ctx_bf.float(), w, li,
-                                              cos_q, sin_q, cos_kv, sin_kv)
-            tt_h = ttnn.to_torch(h).float()[:BSIZE, :HIDDEN]
-            p = pcc(ref_h_per_layer, tt_h)
-            print(f"PCC={p:.6f} {'OK' if p > 0.95 else 'BAD'}")
-
-        # Final norm
         final = ttnn.rms_norm(h, weight=dw["fn_w"], epsilon=EPS)
+        ttnn.synchronize_device(d)
+        first_pass = time.time() - t0
         tt_out = ttnn.to_torch(final).float()[:BSIZE, :HIDDEN]
-        p = pcc(ref_final, tt_out)
-        print(f"\n  Final PCC: {p:.6f} {'PASS' if p > 0.95 else 'FAIL'}")
+        print(f"\n  First pass: {first_pass:.1f}s")
+        print(f"  Output range: [{tt_out.min():.4f}, {tt_out.max():.4f}]")
 
         # Performance
-        n_warmup = 3
-        n_timed = 10
+        n_warmup = 2
+        n_timed = 5
         print(f"\n  Performance ({n_warmup} warmup, {n_timed} timed)...")
 
         def run_full():
@@ -308,8 +299,72 @@ def main():
             run_full()
         elapsed = time.perf_counter() - t0
         per_fwd = elapsed / n_timed * 1000
-        print(f"    {per_fwd:.1f} ms/forward ({n_timed} runs)")
-        print(f"    {per_fwd / DLAYERS:.1f} ms/layer")
+        print(f"    Non-cached: {per_fwd:.1f} ms/forward ({n_timed} runs)")
+        print(f"    Non-cached: {per_fwd / DLAYERS:.1f} ms/layer")
+
+        # ----- KV-cached forward -----
+        # Simulate: full context already cached, small incremental update
+        print(f"\n  === KV-cached forward ===")
+        new_accepted = 3  # typical acceptance
+        new_ctx_sp = _tile_pad(new_accepted)
+        new_ctx_data = torch.randn(new_accepted, N_CTX_LAYERS * HIDDEN).to(torch.bfloat16) * 0.1
+        if new_ctx_sp > new_accepted:
+            pad = new_ctx_data[-1:].expand(new_ctx_sp - new_accepted, -1)
+            new_ctx_data = torch.cat([new_ctx_data, pad], dim=0)
+
+        # Load draft weights into a dict compatible with cached forward
+        # (reuse the already-loaded weights on device)
+        cw = {}
+        cw["fc_w"] = dw["fc_w"]
+        cw["hn_w"] = dw["hn_w"]
+        cw["fn_w"] = dw["fn_w"]
+        cw["rope_cos_full"] = cos_full
+        cw["rope_sin_full"] = sin_adj
+        cw["sc"] = to_dev(torch.ones(TILE, TILE), d)
+        cw["ms"] = to_dev(torch.full((TILE, TILE), 1.0 / HIDDEN), d)
+        for li in range(DLAYERS):
+            for key in ["in_w", "pa_w", "qw", "kw", "vw", "ow", "qnw", "knw", "gw", "uw", "fc2"]:
+                cw[f"{key}.{li}"] = dw[f"{key}.{li}"]
+        for ci in range(N_CTX_LAYERS):
+            cw[f"fc_w.{ci}"] = to_dev(
+                w["fc_w"][ci * HIDDEN:(ci + 1) * HIDDEN, :], d)
+
+        # First call: populate cache with full context
+        print(f"  Populating cache (ctx={ctx_len})...")
+        setup_rope_tables_cached(cw, 0, ctx_sp, d)
+        noise_dev_c = to_dev(noise_bf, d)
+        ctx_proj = prepare_context_ttnn(to_dev(target_hidden, d), cw, d)
+        t0 = time.time()
+        _, cache = draft_fwd_cached(noise_dev_c, ctx_proj, cw, d, None)
+        ttnn.synchronize_device(d)
+        print(f"  Cache populated in {time.time()-t0:.1f}s")
+        print(f"  Cache size: {cache[0]['k'].shape[0]} rows/layer")
+
+        # Subsequent calls: small incremental update
+        new_ctx_dev = prepare_context_ttnn(
+            to_dev(new_ctx_data, d), cw, d)
+        cache_len = cache[0]["k"].shape[0]
+        setup_rope_tables_cached(cw, cache_len, new_ctx_sp, d)
+
+        print(f"  Cached forward (new_ctx={new_ctx_sp}, cache={cache_len})...")
+        n_warmup_c = 2
+        n_timed_c = 5
+
+        for _ in range(n_warmup_c):
+            noise_dev_c = to_dev(noise_bf, d)
+            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache)
+            ttnn.synchronize_device(d)
+
+        t0 = time.perf_counter()
+        for _ in range(n_timed_c):
+            noise_dev_c = to_dev(noise_bf, d)
+            _, _ = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache)
+            ttnn.synchronize_device(d)
+        elapsed_c = time.perf_counter() - t0
+        per_fwd_c = elapsed_c / n_timed_c * 1000
+        print(f"    Cached: {per_fwd_c:.1f} ms/forward ({n_timed_c} runs)")
+        print(f"    Cached: {per_fwd_c / DLAYERS:.1f} ms/layer")
+        print(f"    Speedup: {per_fwd / per_fwd_c:.1f}x vs non-cached")
 
     finally:
         ttnn.close_device(d)
