@@ -32,6 +32,8 @@ USE_TTLANG = True
 dflash_draft.TTLANG_ENABLED = USE_TTLANG
 # TT-Lang rmsnorm has ~0.63x magnitude bug on mesh -- enable to test the flow
 dflash_draft.TTLANG_RMSNORM = False
+# Disable noise caching to test acceptance rate impact
+dflash_draft.CACHE_NOISE = False
 
 
 def extract_context_feature(hidden_states, layer_ids):
@@ -138,10 +140,13 @@ def main():
             ahist.append(acc + 1)
 
             # === Device: crop cache + prepare new context ===
-            # Crop to exact start (not tile-padded) so cache accumulates properly.
-            # At small scales, _tile_pad(start) <= ctx_sp which discards new data.
-            cache_rows = start
-            cache = crop_cache(cache, cache_rows)
+            if dflash_draft.CACHE_NOISE:
+                # Crop to exact start to remove rejected noise positions.
+                cache_rows = start
+                cache = crop_cache(cache, cache_rows)
+            else:
+                # Context-only cache: no noise to crop, cache_rows = ctx rows
+                cache_rows = cache[0]["k"].shape[2]
 
             # Only extract NEW context (accepted positions from this step)
             new_ctx_cpu = extract_context_feature(

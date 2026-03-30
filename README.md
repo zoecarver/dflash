@@ -42,7 +42,7 @@ Target model: 4-chip tensor parallelism. Draft model: replicated across the same
   │   │  SDPA (non-causal, GQA) │    │                                  │
   │   │  O proj + residual      │    │                                  │
   │   │  MLP + residual         │    │                                  │
-  │   │  KV cache (grow+crop)    │    │                                  │
+  │   │  KV cache (grow+crop)   │    │                                  │
   │   └──────────┬──────────────┘    │                                  │
   │              ▼                   │                                  │
   │   RMSNorm → lm_head → argmax     │                                  │

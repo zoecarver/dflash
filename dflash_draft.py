@@ -40,6 +40,9 @@ DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
 TTLANG_ENABLED = False
 # TT-Lang rmsnorm produces ~0.63x magnitude on 4-chip mesh (reduction bug).
 TTLANG_RMSNORM = False
+# When True, cache noise K/V (matching reference DynamicCache behavior).
+# When False, only cache context K/V (may improve acceptance at bf16).
+CACHE_NOISE = True
 
 
 def _tile_pad(n):
@@ -531,8 +534,16 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         h = ttnn.add(h, down)
 
-    # Cache all K/V (context + noise); caller crops after acceptance
-    updated = {"k": k4, "v": v4}
+    # Cache K/V; caller crops after acceptance
+    if CACHE_NOISE:
+        updated = {"k": k4, "v": v4}
+    else:
+        # Context-only: slice off noise rows
+        ctx_end = (layer_cache["k"].shape[2] if layer_cache is not None else 0) + new_ctx.shape[0]
+        updated = {
+            "k": ttnn.slice(k4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
+            "v": ttnn.slice(v4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
+        }
 
     return h, updated
 
