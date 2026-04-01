@@ -10,12 +10,19 @@ import torch.nn.functional as F
 import ttnn
 from safetensors import safe_open
 from rope import make_rope_kernel
+import dflash_draft
 from dflash_draft import (
     draft_fwd_cached, setup_rope_tables_cached, prepare_context_ttnn,
     load_draft_weights, setup_rope_tables, draft_fwd_ttnn,
     prealloc_cached_scratch, crop_cache,
     to_dev as dd_to_dev, _tile_pad,
+    enable_op_timing, disable_op_timing, print_op_timing, _timed_call,
 )
+from residual_add import residual_add_kernel
+from silu_mul import silu_mul_kernel
+
+# Enable TT-Lang kernels in dflash_draft cached forward
+dflash_draft.TTLANG_ENABLED = True
 
 TILE = 32
 HIDDEN = 2048
@@ -131,8 +138,8 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
 
     q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
     k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
-    q_rope_k(q_normed, dw["rope_cos_q"], dw["rope_sin_q"], q_roped)
-    k_rope_k(k_normed, dw["rope_cos_kv"], dw["rope_sin_kv"], k_roped)
+    _timed_call("q_rope", d, q_rope_k, q_normed, dw["rope_cos_q"], dw["rope_sin_q"], q_roped)
+    _timed_call("k_rope", d, k_rope_k, k_normed, dw["rope_cos_kv"], dw["rope_sin_kv"], k_roped)
 
     # SDPA: fused attention
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
@@ -142,16 +149,21 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     o = ttnn.matmul(attn_flat, dw[f"ow.{li}"])
-    h = ttnn.add(h, o)
+
+    h_new = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
+    h = h_new
 
     normed2 = ttnn.rms_norm(h, weight=dw[f"pa_w.{li}"], epsilon=EPS)
     gate = ttnn.matmul(normed2, dw[f"gw.{li}"])
     up = ttnn.matmul(normed2, dw[f"uw.{li}"])
-    act = ttnn.mul(ttnn.silu(gate), up)
+    act = ttnn.zeros_like(gate)
+    _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
     down = ttnn.matmul(act, dw[f"fc2.{li}"])
 
-    h = ttnn.add(h, down)
-    return h
+    h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
+    return h_new2
 
 
 def main():
@@ -275,6 +287,7 @@ def main():
         for _ in range(n_warmup):
             run_full()
 
+        enable_op_timing()
         t0 = time.perf_counter()
         for _ in range(n_timed):
             run_full()
@@ -282,6 +295,9 @@ def main():
         per_fwd = elapsed / n_timed * 1000
         print(f"    Non-cached: {per_fwd:.1f} ms/forward ({n_timed} runs)")
         print(f"    Non-cached: {per_fwd / DLAYERS:.1f} ms/layer")
+        print(f"\n  TT-Lang op timing (non-cached, {n_timed} runs):")
+        print_op_timing()
+        disable_op_timing()
 
         # ----- KV-cached forward -----
         # Simulate: full context already cached, small incremental update
@@ -346,6 +362,7 @@ def main():
             _, tmp_cache = draft_fwd_cached(noise_dev_c, new_ctx_dev, cw, d, cache, sc)
             ttnn.synchronize_device(d)
 
+        enable_op_timing()
         t0 = time.perf_counter()
         for _ in range(n_timed_c):
             noise_dev_c = to_dev(noise_bf, d)
@@ -356,6 +373,9 @@ def main():
         print(f"    Cached: {per_fwd_c:.1f} ms/forward ({n_timed_c} runs)")
         print(f"    Cached: {per_fwd_c / DLAYERS:.1f} ms/layer")
         print(f"    Speedup: {per_fwd / per_fwd_c:.1f}x vs non-cached")
+        print(f"\n  TT-Lang op timing (cached, {n_timed_c} runs):")
+        print_op_timing()
+        disable_op_timing()
 
     finally:
         ttnn.close_device(d)

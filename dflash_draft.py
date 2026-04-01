@@ -44,6 +44,51 @@ TTLANG_RMSNORM = False
 # When False, only cache context K/V (may improve acceptance at bf16).
 CACHE_NOISE = True
 
+# Per-operation timing accumulator
+_op_times = {}
+_op_counts = {}
+_timing_enabled = False
+
+
+def enable_op_timing():
+    global _timing_enabled
+    _timing_enabled = True
+    _op_times.clear()
+    _op_counts.clear()
+
+
+def disable_op_timing():
+    global _timing_enabled
+    _timing_enabled = False
+
+
+def print_op_timing():
+    if not _op_times:
+        print("  (no op timings recorded)")
+        return
+    print(f"  {'Operation':<25} {'Total (ms)':>10} {'Count':>6} {'Avg (ms)':>10}")
+    print(f"  {'-'*25} {'-'*10} {'-'*6} {'-'*10}")
+    for name in sorted(_op_times, key=lambda k: -_op_times[k]):
+        total = _op_times[name] * 1000
+        count = _op_counts[name]
+        avg = total / count
+        print(f"  {name:<25} {total:>10.2f} {count:>6} {avg:>10.3f}")
+    grand = sum(_op_times.values()) * 1000
+    print(f"  {'TOTAL':<25} {grand:>10.2f}")
+
+
+def _timed_call(name, device, fn, *args):
+    if not _timing_enabled:
+        return fn(*args)
+    ttnn.synchronize_device(device)
+    t0 = time.perf_counter()
+    result = fn(*args)
+    ttnn.synchronize_device(device)
+    elapsed = time.perf_counter() - t0
+    _op_times[name] = _op_times.get(name, 0) + elapsed
+    _op_counts[name] = _op_counts.get(name, 0) + 1
+    return result
+
 
 def _tile_pad(n):
     return ((n + TILE - 1) // TILE) * TILE
@@ -327,8 +372,8 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     # TT-Lang rope (always -- element-wise, works on mesh)
     q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
     k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
-    q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
-    k_rope_k(k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
+    _timed_call("q_rope", d, q_rope_k, q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
+    _timed_call("k_rope", d, k_rope_k, k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
 
     # SDPA: fused Q×K^T + scale + softmax + probs×V
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
@@ -344,7 +389,7 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     # Residual add: TT-Lang or TTNN
     if TTLANG_ENABLED:
         h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        residual_add_kernel(h, o, h_new)
+        _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
         h = h_new
     else:
         h = ttnn.add(h, o)
@@ -362,7 +407,7 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     # SiLU * mul: TT-Lang or TTNN
     if TTLANG_ENABLED:
         act = ttnn.zeros_like(gate)
-        silu_mul_kernel(gate, up, act)
+        _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
     else:
         act = ttnn.mul(ttnn.silu(gate), up)
 
@@ -371,7 +416,7 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     # Residual add: TT-Lang or TTNN
     if TTLANG_ENABLED:
         h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        residual_add_kernel(h, down, h_new2)
+        _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
         return h_new2
     else:
         return ttnn.add(h, down)
@@ -522,8 +567,8 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
         new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-    q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
-    k_rope_k(new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
+    _timed_call("q_rope", d, q_rope_k, q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
+    _timed_call("k_rope", d, k_rope_k, new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
 
     # Reshape new K/V to 4D for cache concat and SDPA
     new_k_4d = ttnn.transpose(ttnn.reshape(new_k_roped, (1, new_kv_sp, NKVH, HDIM)), 1, 2)
@@ -549,7 +594,7 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     # Residual add
     if TTLANG_ENABLED:
         h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        residual_add_kernel(h, o, h_new)
+        _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
         h = h_new
     else:
         h = ttnn.add(h, o)
@@ -567,7 +612,7 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     # SiLU * mul
     if TTLANG_ENABLED:
         act = ttnn.zeros_like(gate)
-        silu_mul_kernel(gate, up, act)
+        _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
     else:
         act = ttnn.mul(ttnn.silu(gate), up)
 
@@ -576,7 +621,7 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     # Residual add
     if TTLANG_ENABLED:
         h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        residual_add_kernel(h, down, h_new2)
+        _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
         h = h_new2
     else:
         h = ttnn.add(h, down)
