@@ -26,7 +26,7 @@ def make_argmax_kernel(col_tiles):
           out:     (R, TILE) argmax index per row in column 0
     """
 
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def argmax_kernel(x, indices, scaler, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         row_tiles = x.shape[0] // TILE
@@ -45,7 +45,7 @@ def make_argmax_kernel(col_tiles):
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.wait() as sc:
                 for local_r in range(rows_per_core):
                     row = core_x * rows_per_core + local_r
@@ -64,7 +64,7 @@ def make_argmax_kernel(col_tiles):
 
                         # Broadcast max to full tile shape for phase 2
                         with acc_dfb.wait() as max_scalar, maxb_dfb.reserve() as mb:
-                            mb.store(ttl.math.broadcast(max_scalar, dims=[1]))
+                            mb.store(ttl.math.broadcast(max_scalar, mb, dims=[1]))
 
                         # === Phase 2: find index via mask * indices ===
                         with maxb_dfb.wait() as row_max:
@@ -95,7 +95,7 @@ def make_argmax_kernel(col_tiles):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.reserve() as blk:
                 tx = ttl.copy(scaler[0, 0], blk); tx.wait()
 
@@ -115,7 +115,7 @@ def make_argmax_kernel(col_tiles):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_r in range(rows_per_core):
                 row = core_x * rows_per_core + local_r
                 if row < row_tiles:

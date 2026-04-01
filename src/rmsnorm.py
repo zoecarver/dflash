@@ -10,7 +10,7 @@ TILE = 32
 def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
     c_eps = eps
 
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def rmsnorm_kernel(x, weight, scaler, mean_scale, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = x.shape[0] // TILE
@@ -30,7 +30,7 @@ def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
                 for local_t in range(tiles_per_core):
                     tile_idx = core_x * tiles_per_core + local_t
@@ -55,7 +55,7 @@ def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
 
                         # Compute rsqrt(mean(x^2) + eps)
                         with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
-                            bc.store(ttl.math.broadcast(total, dims=[1]))
+                            bc.store(ttl.math.broadcast(total, bc, dims=[1]))
                         with bcast_dfb.wait() as bc_val, istd_dfb.reserve() as istd:
                             istd.store(ttl.math.rsqrt(bc_val * ms + ttl.math.fill(bc_val, c_eps)))
 
@@ -67,7 +67,7 @@ def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.reserve() as blk:
                 tx = ttl.copy(scaler[0, 0], blk); tx.wait()
             with ms_dfb.reserve() as blk:
@@ -89,7 +89,7 @@ def make_rmsnorm_kernel(dim_tiles, eps=1e-6):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
                 if tile_idx < seq_tiles:

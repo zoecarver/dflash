@@ -25,7 +25,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
     scores_bf = min(kv_tiles * n_heads + hdim_tiles, 32)
     bf = hdim_tiles
 
-    @ttl.kernel(grid=(1, 1))
+    @ttl.operation(grid=(1, 1))
     def cross_attention(q, k_t, v, scaler, out):
         q_dfb = ttl.make_dataflow_buffer_like(q, shape=(1, hdim_tiles), buffer_factor=2)
         kt_col_dfb = ttl.make_dataflow_buffer_like(k_t, shape=(hdim_tiles, 1), buffer_factor=2)
@@ -69,7 +69,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
 
                     # Broadcast max for Passes 2 and 3
                     with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                        mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                        mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                         mx_keep.store(mx)
 
                     # ====== Pass 2: streaming sum of exp(s - broadcast(max)) ======
@@ -84,7 +84,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
                             with kt_col_dfb.wait() as kc, s2_dfb.reserve() as s:
                                 s.store(qb @ kc)
                             with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                                mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                                mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                                 mx_keep.store(mx)
                             with s2_dfb.wait() as sv, max_bc_dfb.wait() as mxbc, exp_scores_dfb.reserve() as es:
                                 es.store(ttl.math.exp(sv - mxbc))
@@ -97,7 +97,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
                     with sum_acc_dfb.wait() as sm, exp_sum_dfb.reserve() as sinv:
                         sinv.store(ttl.math.recip(sm))
                     with exp_sum_dfb.wait() as sinv, sinv_bc_dfb.reserve() as sibc:
-                        sibc.store(ttl.math.broadcast(sinv, dims=[1]))
+                        sibc.store(ttl.math.broadcast(sinv, sibc, dims=[1]))
 
                     # ====== Pass 3: weighted V accumulation ======
                     with q_dfb.wait() as qb:
@@ -105,7 +105,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
                         with kt_col_dfb.wait() as kc, s3_dfb.reserve() as s:
                             s.store(qb @ kc)
                         with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                            mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                            mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                             mx_keep.store(mx)
                         with s3_dfb.wait() as sv, max_bc_dfb.wait() as mxbc, exp_scores_dfb.reserve() as e:
                             e.store(ttl.math.exp(sv - mxbc))
@@ -121,7 +121,7 @@ def make_cross_attention_kernel(n_heads, hdim_tiles, kv_tiles):
                             with kt_col_dfb.wait() as kc, s3_dfb.reserve() as s:
                                 s.store(qb @ kc)
                             with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                                mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                                mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                                 mx_keep.store(mx)
                             with s3_dfb.wait() as sv, max_bc_dfb.wait() as mxbc, exp_scores_dfb.reserve() as e:
                                 e.store(ttl.math.exp(sv - mxbc))

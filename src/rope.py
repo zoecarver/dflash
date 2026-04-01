@@ -18,7 +18,7 @@ TILE = 32
 def make_rope_kernel(head_tiles, n_heads):
     half = head_tiles // 2
 
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def rope_kernel(q, cos_tab, sin_adj_tab, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = q.shape[0] // TILE
@@ -33,7 +33,7 @@ def make_rope_kernel(head_tiles, n_heads):
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(units_per_core):
                 unit = core_x * units_per_core + local_t
                 if unit < total:
@@ -43,7 +43,7 @@ def make_rope_kernel(head_tiles, n_heads):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(units_per_core):
                 unit = core_x * units_per_core + local_t
                 if unit < total:
@@ -64,7 +64,7 @@ def make_rope_kernel(head_tiles, n_heads):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(units_per_core):
                 unit = core_x * units_per_core + local_t
                 if unit < total:

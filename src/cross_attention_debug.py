@@ -6,7 +6,7 @@ TILE = 32
 
 def make_scores_only_kernel(n_heads, hdim_tiles, kv_tiles):
     """Just compute Q @ K^T -> scores. No softmax."""
-    @ttl.kernel(grid=(1, 1))
+    @ttl.operation(grid=(1, 1))
     def scores_kernel(q, k_t, out):
         q_dfb = ttl.make_dataflow_buffer_like(q, shape=(n_heads, hdim_tiles), buffer_factor=1)
         kt_dfb = ttl.make_dataflow_buffer_like(k_t, shape=(hdim_tiles, kv_tiles), buffer_factor=1)
@@ -34,7 +34,7 @@ def make_scores_only_kernel(n_heads, hdim_tiles, kv_tiles):
 
 def make_softmax_kernel(n_heads, kv_tiles):
     """Softmax on (n_heads, kv_tiles) score matrix. dims=[1] reduction."""
-    @ttl.kernel(grid=(1, 1))
+    @ttl.operation(grid=(1, 1))
     def softmax_kernel(scores, scaler, out):
         s_dfb = ttl.make_dataflow_buffer_like(scores, shape=(n_heads, kv_tiles), buffer_factor=2)
         scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
@@ -53,7 +53,7 @@ def make_softmax_kernel(n_heads, kv_tiles):
             with s_dfb.wait() as s, scaler_dfb.wait() as sc, max_dfb.reserve() as mx:
                 mx.store(ttl.math.reduce_max(s, sc, dims=[1]))
             with max_dfb.wait() as mx, max_bc_dfb.reserve() as mxb:
-                mxb.store(ttl.math.broadcast(mx, dims=[1]))
+                mxb.store(ttl.math.broadcast(mx, mxb, dims=[1]))
             # Exp(s - max)
             with s_dfb.wait() as s2, max_bc_dfb.wait() as mxb, exp_dfb.reserve() as e:
                 e.store(ttl.math.exp(s2 - mxb))
@@ -63,7 +63,7 @@ def make_softmax_kernel(n_heads, kv_tiles):
             with sum_dfb.wait() as sm, sum_recip_dfb.reserve() as sr:
                 sr.store(ttl.math.recip(sm))
             with sum_recip_dfb.wait() as sr, sum_bc_dfb.reserve() as sbc:
-                sbc.store(ttl.math.broadcast(sr, dims=[1]))
+                sbc.store(ttl.math.broadcast(sr, sbc, dims=[1]))
             # But exp was consumed! Need to recompute or we just output sum_bc for debugging.
             # Let's just output sum_bc (1/sum broadcast) to verify the reduction pipeline.
             with sum_bc_dfb.wait() as sbc, out_dfb.reserve() as o:

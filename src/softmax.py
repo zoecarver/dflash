@@ -16,7 +16,7 @@ TILE = 32
 def make_softmax_kernel(n_rows, col_tiles):
     bf = 2
 
-    @ttl.kernel(grid=(1, 1))
+    @ttl.operation(grid=(1, 1))
     def softmax(inp, scaler, out):
         inp_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), buffer_factor=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
@@ -46,7 +46,7 @@ def make_softmax_kernel(n_rows, col_tiles):
 
                     # Broadcast max for passes 2 and 3
                     with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                        mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                        mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                         mx_keep.store(mx)
 
                     # Pass 2: streaming sum of exp(s - max)
@@ -57,7 +57,7 @@ def make_softmax_kernel(n_rows, col_tiles):
                     for c in range(1, col_tiles):
                         with inp_dfb.wait() as tile:
                             with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                                mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                                mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                                 mx_keep.store(mx)
                             with max_bc_dfb.wait() as mxbc, exp_dfb.reserve() as e:
                                 e.store(ttl.math.exp(tile - mxbc))
@@ -70,13 +70,13 @@ def make_softmax_kernel(n_rows, col_tiles):
                     with sum_acc_dfb.wait() as sm, sinv_dfb.reserve() as si:
                         si.store(ttl.math.recip(sm))
                     with sinv_dfb.wait() as si, sinv_bc_dfb.reserve() as sibc:
-                        sibc.store(ttl.math.broadcast(si, dims=[1]))
+                        sibc.store(ttl.math.broadcast(si, sibc, dims=[1]))
 
                     # Pass 3: normalize and write
                     for c in range(col_tiles):
                         with inp_dfb.wait() as tile:
                             with max_acc_dfb.wait() as mx, max_bc_dfb.reserve() as mxbc, max_acc_dfb.reserve() as mx_keep:
-                                mxbc.store(ttl.math.broadcast(mx, dims=[1]))
+                                mxbc.store(ttl.math.broadcast(mx, mxbc, dims=[1]))
                                 mx_keep.store(mx)
                             with max_bc_dfb.wait() as mxbc, exp_dfb.reserve() as e:
                                 e.store(ttl.math.exp(tile - mxbc))

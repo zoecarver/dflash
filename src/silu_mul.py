@@ -7,7 +7,7 @@ TILE = 32
 ELEM_GRAN = 8
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def silu_mul_kernel(gate, up, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = gate.shape[0] // TILE
@@ -21,7 +21,7 @@ def silu_mul_kernel(gate, up, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total:
@@ -30,7 +30,7 @@ def silu_mul_kernel(gate, up, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total:
@@ -44,7 +44,7 @@ def silu_mul_kernel(gate, up, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total:
