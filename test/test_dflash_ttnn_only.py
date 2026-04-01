@@ -21,7 +21,8 @@ from dflash_draft import (
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
 from dflash_draft import (o_proj_resadd_k, down_proj_resadd_k, gate_up_silu_k,
-                          norm_k, head_norm_k, DINTER, HDIM_TILES)
+                          norm_k, head_norm_k, q_proj_k, kv_proj_k,
+                          DINTER, HDIM_TILES)
 
 # Enable TT-Lang kernels in dflash_draft cached forward
 dflash_draft.TTLANG_ENABLED = True
@@ -128,10 +129,13 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     normed = to_dev(torch.zeros(SP, HIDDEN), d)
     _timed_call("in_rmsnorm", d, norm_k, h, dw[f"in_w_tt.{li}"], dw["sc"], dw["ms"], normed)
 
-    q = ttnn.matmul(normed, dw[f"qw.{li}"])
+    q = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    _timed_call("q_proj", d, q_proj_k, normed, dw[f"qw.{li}"], q)
     kv_in = ttnn.concat([ctx_dev, normed], dim=0)
-    k = ttnn.matmul(kv_in, dw[f"kw.{li}"])
-    v = ttnn.matmul(kv_in, dw[f"vw.{li}"])
+    k = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+    _timed_call("k_proj", d, kv_proj_k, kv_in, dw[f"kw.{li}"], k)
+    v = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+    _timed_call("v_proj", d, kv_proj_k, kv_in, dw[f"vw.{li}"], v)
 
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))

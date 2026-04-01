@@ -15,6 +15,7 @@ from rope import make_rope_kernel
 from softmax import make_softmax_kernel
 from matmul_residual_add import make_matmul_residual_add_kernel
 from matmul_silu_mul import make_matmul_silu_mul_kernel
+from streaming_matmul import make_matmul_kernel
 
 TILE = 32
 HIDDEN = 2048
@@ -125,6 +126,8 @@ k_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NKVH)
 o_proj_resadd_k = make_matmul_residual_add_kernel(k_tiles=NQH * HDIM_TILES)
 down_proj_resadd_k = make_matmul_residual_add_kernel(k_tiles=DINTER // TILE)
 gate_up_silu_k = make_matmul_silu_mul_kernel(k_tiles=HTILES)
+q_proj_k = make_matmul_kernel(k_tiles=HTILES)
+kv_proj_k = make_matmul_kernel(k_tiles=HTILES)
 
 
 # ---------------------------------------------------------------------------
@@ -353,10 +356,20 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     else:
         normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
 
-    q = ttnn.matmul(normed, w[f"qw.{li}"])
-    kv_in = ttnn.concat([ctx_dev, normed], dim=0)
-    k = ttnn.matmul(kv_in, w[f"kw.{li}"])
-    v = ttnn.matmul(kv_in, w[f"vw.{li}"])
+    # Q/K/V projections
+    if TTLANG_ENABLED:
+        q = to_dev(torch.zeros(SP, NQH * HDIM), d)
+        _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
+        kv_in = ttnn.concat([ctx_dev, normed], dim=0)
+        k = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+        _timed_call("k_proj", d, kv_proj_k, kv_in, w[f"kw.{li}"], k)
+        v = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+        _timed_call("v_proj", d, kv_proj_k, kv_in, w[f"vw.{li}"], v)
+    else:
+        q = ttnn.matmul(normed, w[f"qw.{li}"])
+        kv_in = ttnn.concat([ctx_dev, normed], dim=0)
+        k = ttnn.matmul(kv_in, w[f"kw.{li}"])
+        v = ttnn.matmul(kv_in, w[f"vw.{li}"])
 
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
@@ -538,13 +551,20 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
 
-    # Q from noise only
-    q = ttnn.matmul(normed, w[f"qw.{li}"])
-
-    # K/V from new context + noise only
-    new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
-    new_k = ttnn.matmul(new_kv_in, w[f"kw.{li}"])
-    new_v = ttnn.matmul(new_kv_in, w[f"vw.{li}"])
+    # Q from noise only, K/V from new context + noise
+    if TTLANG_ENABLED:
+        q = to_dev(torch.zeros(SP, NQH * HDIM), d)
+        _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
+        new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
+        new_k = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
+        _timed_call("k_proj", d, kv_proj_k, new_kv_in, w[f"kw.{li}"], new_k)
+        new_v = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
+        _timed_call("v_proj", d, kv_proj_k, new_kv_in, w[f"vw.{li}"], new_v)
+    else:
+        q = ttnn.matmul(normed, w[f"qw.{li}"])
+        new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
+        new_k = ttnn.matmul(new_kv_in, w[f"kw.{li}"])
+        new_v = ttnn.matmul(new_kv_in, w[f"vw.{li}"])
 
     # QK-norm
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
