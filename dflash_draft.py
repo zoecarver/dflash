@@ -346,10 +346,10 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     """Single layer forward. Uses TT-Lang kernels when TTLANG_ENABLED."""
     kv_sp = w["kv_sp"]
 
-    # Input RMSNorm: TT-Lang or TTNN
-    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+    # Input RMSNorm
+    if TTLANG_ENABLED:
         normed = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
+        _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
     else:
         normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
 
@@ -361,12 +361,12 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
 
-    # QK-norm RMSNorm: TT-Lang or TTNN
-    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+    # QK-norm RMSNorm
+    if TTLANG_ENABLED:
         q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
-        head_norm_k(q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+        _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
         k_normed_flat = to_dev(torch.zeros(kv_sp * NKVH, HDIM), d)
-        head_norm_k(k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], k_normed_flat)
+        _timed_call("qk_rmsnorm", d, head_norm_k, k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], k_normed_flat)
     else:
         q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
         k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
@@ -398,10 +398,10 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
         o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
         h = ttnn.add(h, o)
 
-    # Post-attention RMSNorm: TT-Lang or TTNN
-    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+    # Post-attention RMSNorm
+    if TTLANG_ENABLED:
         normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
+        _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
     else:
         normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
@@ -429,10 +429,10 @@ def draft_fwd_ttnn(noise, ctx, w, d):
     h = noise
     for li in range(DLAYERS):
         h = draft_layer_fwd_ttnn(h, ctx, w, li, d)
-    # Final RMSNorm: TT-Lang or TTNN
-    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
+    # Final RMSNorm
+    if TTLANG_ENABLED:
         out = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w["fn_w_tt"], w["sc"], w["ms"], out)
+        _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
         return out
     else:
         return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS)
@@ -532,9 +532,9 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     cache_len = w["total_kv"] - new_kv_sp  # = cache_len passed to setup
 
     # Input RMSNorm
-    if TTLANG_RMSNORM:
+    if TTLANG_ENABLED:
         normed = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
+        _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
     else:
         normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
 
@@ -550,11 +550,11 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     new_k_flat = ttnn.reshape(new_k, (new_kv_sp * NKVH, HDIM))
 
-    if TTLANG_RMSNORM:
+    if TTLANG_ENABLED:
         q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
-        head_norm_k(q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+        _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
         new_k_normed_flat = to_dev(torch.zeros(new_kv_sp * NKVH, HDIM), d)
-        head_norm_k(new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
+        _timed_call("qk_rmsnorm", d, head_norm_k, new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
     else:
         q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
         new_k_normed_flat = ttnn.rms_norm(new_k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
@@ -601,9 +601,9 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
         h = ttnn.add(h, o)
 
     # Post-attention RMSNorm
-    if TTLANG_RMSNORM:
+    if TTLANG_ENABLED:
         normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
+        _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
     else:
         normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
@@ -656,9 +656,9 @@ def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
         h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc, scratch)
         new_cache.append(updated_lc)
     # Final RMSNorm
-    if TTLANG_RMSNORM:
+    if TTLANG_ENABLED:
         out = to_dev(torch.zeros(SP, HIDDEN), d)
-        norm_k(h, w["fn_w_tt"], w["sc"], w["ms"], out)
+        _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
         return out, new_cache
     else:
         return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS), new_cache

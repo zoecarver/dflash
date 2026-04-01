@@ -20,7 +20,8 @@ from dflash_draft import (
 )
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
-from dflash_draft import o_proj_resadd_k, down_proj_resadd_k, gate_up_silu_k, DINTER
+from dflash_draft import (o_proj_resadd_k, down_proj_resadd_k, gate_up_silu_k,
+                          norm_k, head_norm_k, DINTER, HDIM_TILES)
 
 # Enable TT-Lang kernels in dflash_draft cached forward
 dflash_draft.TTLANG_ENABLED = True
@@ -123,7 +124,9 @@ def to_dev(t, d):
 # TTNN-based layer forward (TT-Lang rope only, everything else TTNN)
 # ---------------------------------------------------------------------------
 def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
-    normed = ttnn.rms_norm(h, weight=dw[f"in_w.{li}"], epsilon=EPS)
+    # Input RMSNorm (TT-Lang)
+    normed = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("in_rmsnorm", d, norm_k, h, dw[f"in_w_tt.{li}"], dw["sc"], dw["ms"], normed)
 
     q = ttnn.matmul(normed, dw[f"qw.{li}"])
     kv_in = ttnn.concat([ctx_dev, normed], dim=0)
@@ -132,8 +135,11 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
 
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
-    q_normed_flat = ttnn.rms_norm(q_flat, weight=dw[f"qnw.{li}"], epsilon=EPS)
-    k_normed_flat = ttnn.rms_norm(k_flat, weight=dw[f"knw.{li}"], epsilon=EPS)
+    # QK-norm RMSNorm (TT-Lang)
+    q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, dw[f"qnw_tt.{li}"], dw["sc"], dw["ms_head"], q_normed_flat)
+    k_normed_flat = to_dev(torch.zeros(kv_sp * NKVH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, k_flat, dw[f"knw_tt.{li}"], dw["sc"], dw["ms_head"], k_normed_flat)
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
 
@@ -154,7 +160,9 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, dw[f"ow.{li}"], h, h_new)
     h = h_new
 
-    normed2 = ttnn.rms_norm(h, weight=dw[f"pa_w.{li}"], epsilon=EPS)
+    # Post-attention RMSNorm (TT-Lang)
+    normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("pa_rmsnorm", d, norm_k, h, dw[f"pa_w_tt.{li}"], dw["sc"], dw["ms"], normed2)
 
     # Fused gate/up matmul + silu_mul
     act = to_dev(torch.zeros(SP, DINTER), d)
@@ -221,16 +229,25 @@ def main():
         dw = {}
         dw["fc_w"] = to_dev(w["fc_w"], d)
         dw["hn_w"] = to_dev(w["hn_w"].unsqueeze(0), d)
+        dw["hn_w_tt"] = to_dev(w["hn_w"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
         dw["fn_w"] = to_dev(w["fn_w"].unsqueeze(0), d)
+        dw["fn_w_tt"] = to_dev(w["fn_w"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
+        dw["sc"] = to_dev(torch.ones(TILE, TILE), d)
+        dw["ms"] = to_dev(torch.full((TILE, TILE), 1.0 / HIDDEN), d)
+        dw["ms_head"] = to_dev(torch.full((TILE, TILE), 1.0 / HDIM), d)
         for li in range(DLAYERS):
             dw[f"in_w.{li}"] = to_dev(w[f"in_w.{li}"].unsqueeze(0), d)
+            dw[f"in_w_tt.{li}"] = to_dev(w[f"in_w.{li}"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
             dw[f"pa_w.{li}"] = to_dev(w[f"pa_w.{li}"].unsqueeze(0), d)
+            dw[f"pa_w_tt.{li}"] = to_dev(w[f"pa_w.{li}"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
             dw[f"qw.{li}"] = to_dev(w[f"qw.{li}"], d)
             dw[f"kw.{li}"] = to_dev(w[f"kw.{li}"], d)
             dw[f"vw.{li}"] = to_dev(w[f"vw.{li}"], d)
             dw[f"ow.{li}"] = to_dev(w[f"ow.{li}"], d)
             dw[f"qnw.{li}"] = to_dev(w[f"qnw.{li}"].unsqueeze(0), d)
+            dw[f"qnw_tt.{li}"] = to_dev(w[f"qnw.{li}"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
             dw[f"knw.{li}"] = to_dev(w[f"knw.{li}"].unsqueeze(0), d)
+            dw[f"knw_tt.{li}"] = to_dev(w[f"knw.{li}"].unsqueeze(0).expand(TILE, -1).contiguous(), d)
             dw[f"gw.{li}"] = to_dev(w[f"gw.{li}"], d)
             dw[f"uw.{li}"] = to_dev(w[f"uw.{li}"], d)
             dw[f"fc2.{li}"] = to_dev(w[f"fc2.{li}"], d)
@@ -265,7 +282,8 @@ def main():
         for li in range(DLAYERS):
             print(f"    Layer {li}...", flush=True)
             h = dev_layer_fwd_ttnn(h, ctx_norm, dw, li, q_rope, k_rope, kv_sp, d)
-        final = ttnn.rms_norm(h, weight=dw["fn_w"], epsilon=EPS)
+        final = to_dev(torch.zeros(SP, HIDDEN), d)
+        norm_k(h, dw["fn_w_tt"], dw["sc"], dw["ms"], final)
         ttnn.synchronize_device(d)
         first_pass = time.time() - t0
         tt_out = ttnn.to_torch(final).float()[:BSIZE, :HIDDEN]
@@ -281,7 +299,8 @@ def main():
             hh = to_dev(noise_bf, d)
             for li in range(DLAYERS):
                 hh = dev_layer_fwd_ttnn(hh, ctx_norm, dw, li, q_rope, k_rope, kv_sp, d)
-            ttnn.rms_norm(hh, weight=dw["fn_w"], epsilon=EPS)
+            fn_out = to_dev(torch.zeros(SP, HIDDEN), d)
+            norm_k(hh, dw["fn_w_tt"], dw["sc"], dw["ms"], fn_out)
             ttnn.synchronize_device(d)
 
         for _ in range(n_warmup):
@@ -315,13 +334,18 @@ def main():
         cw["fc_w"] = dw["fc_w"]
         cw["hn_w"] = dw["hn_w"]
         cw["fn_w"] = dw["fn_w"]
+        cw["fn_w_tt"] = dw["fn_w_tt"]
+        cw["hn_w_tt"] = dw["hn_w_tt"]
+        cw["ms_head"] = dw["ms_head"]
         cw["rope_cos_full"] = cos_full
         cw["rope_sin_full"] = sin_adj
         cw["sc"] = to_dev(torch.ones(TILE, TILE), d)
         cw["ms"] = to_dev(torch.full((TILE, TILE), 1.0 / HIDDEN), d)
         for li in range(DLAYERS):
-            for key in ["in_w", "pa_w", "qw", "kw", "vw", "ow", "qnw", "knw", "gw", "uw", "fc2"]:
-                cw[f"{key}.{li}"] = dw[f"{key}.{li}"]
+            for key in ["in_w", "pa_w", "qw", "kw", "vw", "ow", "qnw", "knw", "gw", "uw", "fc2",
+                         "in_w_tt", "pa_w_tt", "qnw_tt", "knw_tt"]:
+                if f"{key}.{li}" in dw:
+                    cw[f"{key}.{li}"] = dw[f"{key}.{li}"]
         for ci in range(N_CTX_LAYERS):
             cw[f"fc_w.{ci}"] = to_dev(
                 w["fc_w"][ci * HIDDEN:(ci + 1) * HIDDEN, :], d)
