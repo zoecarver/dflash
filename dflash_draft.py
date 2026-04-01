@@ -13,6 +13,8 @@ from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
 from rope import make_rope_kernel
 from softmax import make_softmax_kernel
+from matmul_residual_add import make_matmul_residual_add_kernel
+from matmul_silu_mul import make_matmul_silu_mul_kernel
 
 TILE = 32
 HIDDEN = 2048
@@ -120,6 +122,9 @@ norm_k = make_rmsnorm_kernel(dim_tiles=HTILES, eps=EPS)
 head_norm_k = make_rmsnorm_kernel(dim_tiles=HDIM_TILES, eps=EPS)
 q_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NQH)
 k_rope_k = make_rope_kernel(head_tiles=HDIM_TILES, n_heads=NKVH)
+o_proj_resadd_k = make_matmul_residual_add_kernel(k_tiles=NQH * HDIM_TILES)
+down_proj_resadd_k = make_matmul_residual_add_kernel(k_tiles=DINTER // TILE)
+gate_up_silu_k = make_matmul_silu_mul_kernel(k_tiles=HTILES)
 
 
 # ---------------------------------------------------------------------------
@@ -384,14 +389,13 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
         q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
-    o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-
-    # Residual add: TT-Lang or TTNN
+    # Fused o_proj matmul + residual add: h = (attn_flat @ ow) + h
     if TTLANG_ENABLED:
         h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
+        _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
         h = h_new
     else:
+        o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
         h = ttnn.add(h, o)
 
     # Post-attention RMSNorm: TT-Lang or TTNN
@@ -401,24 +405,22 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
     else:
         normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
-    gate = ttnn.matmul(normed2, w[f"gw.{li}"])
-    up = ttnn.matmul(normed2, w[f"uw.{li}"])
-
-    # SiLU * mul: TT-Lang or TTNN
+    # Fused gate/up matmul + silu_mul: act = silu(normed2 @ gw) * (normed2 @ uw)
     if TTLANG_ENABLED:
-        act = ttnn.zeros_like(gate)
-        _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
+        act = to_dev(torch.zeros(SP, DINTER), d)
+        _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
     else:
+        gate = ttnn.matmul(normed2, w[f"gw.{li}"])
+        up = ttnn.matmul(normed2, w[f"uw.{li}"])
         act = ttnn.mul(ttnn.silu(gate), up)
 
-    down = ttnn.matmul(act, w[f"fc2.{li}"])
-
-    # Residual add: TT-Lang or TTNN
+    # Fused down_proj matmul + residual add: h = (act @ fc2) + h
     if TTLANG_ENABLED:
         h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
+        _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
         return h_new2
     else:
+        down = ttnn.matmul(act, w[f"fc2.{li}"])
         return ttnn.add(h, down)
 
 
@@ -589,14 +591,13 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
         q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
-    o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-
-    # Residual add
+    # Fused o_proj matmul + residual add: h = (attn_flat @ ow) + h
     if TTLANG_ENABLED:
         h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
+        _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
         h = h_new
     else:
+        o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
         h = ttnn.add(h, o)
 
     # Post-attention RMSNorm
@@ -606,24 +607,22 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     else:
         normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
 
-    gate = ttnn.matmul(normed2, w[f"gw.{li}"])
-    up = ttnn.matmul(normed2, w[f"uw.{li}"])
-
-    # SiLU * mul
+    # Fused gate/up matmul + silu_mul: act = silu(normed2 @ gw) * (normed2 @ uw)
     if TTLANG_ENABLED:
-        act = ttnn.zeros_like(gate)
-        _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
+        act = to_dev(torch.zeros(SP, DINTER), d)
+        _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
     else:
+        gate = ttnn.matmul(normed2, w[f"gw.{li}"])
+        up = ttnn.matmul(normed2, w[f"uw.{li}"])
         act = ttnn.mul(ttnn.silu(gate), up)
 
-    down = ttnn.matmul(act, w[f"fc2.{li}"])
-
-    # Residual add
+    # Fused down_proj matmul + residual add: h = (act @ fc2) + h
     if TTLANG_ENABLED:
         h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
+        _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
         h = h_new2
     else:
+        down = ttnn.matmul(act, w[f"fc2.{li}"])
         h = ttnn.add(h, down)
 
     # Cache K/V; reference model only caches context (not noise)

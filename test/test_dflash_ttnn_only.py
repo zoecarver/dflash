@@ -20,6 +20,7 @@ from dflash_draft import (
 )
 from residual_add import residual_add_kernel
 from silu_mul import silu_mul_kernel
+from dflash_draft import o_proj_resadd_k, down_proj_resadd_k, gate_up_silu_k, DINTER
 
 # Enable TT-Lang kernels in dflash_draft cached forward
 dflash_draft.TTLANG_ENABLED = True
@@ -148,21 +149,20 @@ def dev_layer_fwd_ttnn(h, ctx_dev, dw, li, q_rope_k, k_rope_k, kv_sp, d):
     attn = ttnn.transformer.scaled_dot_product_attention(q4, k4, v4, is_causal=False)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
-    o = ttnn.matmul(attn_flat, dw[f"ow.{li}"])
-
+    # Fused o_proj matmul + residual add
     h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("residual_add", d, residual_add_kernel, h, o, h_new)
+    _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, dw[f"ow.{li}"], h, h_new)
     h = h_new
 
     normed2 = ttnn.rms_norm(h, weight=dw[f"pa_w.{li}"], epsilon=EPS)
-    gate = ttnn.matmul(normed2, dw[f"gw.{li}"])
-    up = ttnn.matmul(normed2, dw[f"uw.{li}"])
-    act = ttnn.zeros_like(gate)
-    _timed_call("silu_mul", d, silu_mul_kernel, gate, up, act)
-    down = ttnn.matmul(act, dw[f"fc2.{li}"])
 
+    # Fused gate/up matmul + silu_mul
+    act = to_dev(torch.zeros(SP, DINTER), d)
+    _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, dw[f"gw.{li}"], dw[f"uw.{li}"], act)
+
+    # Fused down_proj matmul + residual add
     h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("residual_add", d, residual_add_kernel, h, down, h_new2)
+    _timed_call("down+resadd", d, down_proj_resadd_k, act, dw[f"fc2.{li}"], h, h_new2)
     return h_new2
 
 
