@@ -1,6 +1,6 @@
 """Speculative decoding: CPU Qwen3 target + Tenstorrent DFlash draft.
 
-CPU Qwen3 (transformers) produces logits and hidden states — stock model,
+CPU Qwen3 (transformers) produces logits and hidden states -- stock model,
 nothing custom. Everything DFlash-related runs on Tenstorrent: context
 projection, 8-layer draft forward, lm_head, argmax.
 
@@ -22,8 +22,7 @@ from device import (
 )
 import dflash_draft
 from dflash_draft import (
-    load_draft_weights, draft_fwd_cached, draft_fwd_ttnn,
-    prepare_context_ttnn, setup_rope_tables, setup_rope_tables_cached,
+    DFlashDraft, crop_cache,
     to_dev as draft_to_dev,
     BSIZE, TLAYER_IDS, MASK_ID, SP, N_CTX_LAYERS,
     _tile_pad,
@@ -49,15 +48,15 @@ def main():
     target.eval()
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
-    # --- Device: load DFlash draft weights ---
+    # --- Device: load DFlash draft ---
     print("Opening Tenstorrent device...")
     d = open_dev()
 
     try:
-        dw = load_draft_weights(d)
+        draft = DFlashDraft(d)
         # lm_head from target model, replicated on device for draft logits
         lm_head_host = target.lm_head.weight.data.T.contiguous().to(torch.bfloat16)
-        dw["lm_head_rep"] = rep(lm_head_host, d)
+        draft.w["lm_head_rep"] = rep(lm_head_host, d)
 
         emb_weight = target.model.embed_tokens.weight.data.to(torch.bfloat16)
 
@@ -93,7 +92,11 @@ def main():
         init_ctx_padded = init_ctx_cpu
         if init_ctx_sp > pl:
             init_ctx_padded = F.pad(init_ctx_cpu, (0, 0, 0, init_ctx_sp - pl))
-        init_ctx_dev = prepare_context_ttnn(rep(init_ctx_padded, d), dw, d)
+        init_ctx_dev = draft.prepare_context(rep(init_ctx_padded, d))
+
+        # Pre-allocate scratch for decode (first step uses init_ctx_sp, later steps are smaller)
+        first_kv_sp = init_ctx_sp + SP
+        draft.alloc_scratch(first_kv_sp)
 
         start = pl
         gen = 0
@@ -119,19 +122,24 @@ def main():
                 if new_ctx_sp > new_ctx_real:
                     new_ctx_padded = F.pad(new_ctx_cpu,
                                            (0, 0, 0, new_ctx_sp - new_ctx_real))
-                new_ctx_dev = prepare_context_ttnn(rep(new_ctx_padded, d), dw, d)
+                new_ctx_dev = draft.prepare_context(rep(new_ctx_padded, d))
 
-            setup_rope_tables_cached(dw, cache_rows, new_ctx_sp, d,
-                                     q_start=start,
-                                     new_ctx_real=new_ctx_real)
+                # Re-allocate scratch if new_kv_sp changed
+                new_kv_sp = new_ctx_sp + SP
+                if new_kv_sp != first_kv_sp:
+                    draft.alloc_scratch(new_kv_sp)
+                    first_kv_sp = new_kv_sp
+
+            draft.setup_rope(cache_rows, new_ctx_sp,
+                             q_start=start, new_ctx_real=new_ctx_real)
 
             noise = _p(emb_weight[bids])
             if noise.shape[0] < SP:
                 noise = F.pad(noise, (0, 0, 0, SP - noise.shape[0]))
             noise_dev = draft_to_dev(noise, d)
 
-            dout, cache = draft_fwd_cached(noise_dev, new_ctx_dev, dw, d, cache)
-            dl = ttnn.matmul(dout, dw["lm_head_rep"])
+            dout, cache = draft.step(noise_dev, new_ctx_dev, cache)
+            dl = ttnn.matmul(dout, draft.w["lm_head_rep"])
             draft_tokens = ttnn.argmax(dl, dim=-1)
             draft_ids = rb(draft_tokens)[:BSIZE].long().squeeze(-1)
             bids[1:] = draft_ids[1:BSIZE]

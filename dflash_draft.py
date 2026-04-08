@@ -391,56 +391,42 @@ def setup_rope_tables_cached(w, cache_rows, new_ctx_sp, d, q_start=None,
         w["attn_mask"] = None
 
 
-def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
+def _layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, s):
     """Single layer forward with KV cache.
 
     h: noise hidden states (SP, HIDDEN)
     new_ctx: new context rows (new_ctx_sp, HIDDEN), already projected+normed
     layer_cache: {"k": (1, NKVH, cache_len, HDIM), "v": same} in 4D or None
-    scratch: pre-allocated tensors from prealloc_cached_scratch, or None
+    s: scratch buffers dict
     Returns: (h_out, updated_layer_cache)
     """
-    new_ctx_sp = new_ctx.shape[0]
     new_kv_sp = w["new_kv_sp"]
-    total_kv = w["total_kv"]
     cache_len = w["total_kv"] - new_kv_sp
 
     # Input RMSNorm
-    normed = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
+    _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], s["normed"])
 
     # Q from noise only, K/V from new context + noise
-    q = to_dev(torch.zeros(SP, NQH * HDIM), d)
-    _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
-    new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
-    new_k = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-    _timed_call("k_proj", d, kv_proj_k, new_kv_in, w[f"kw.{li}"], new_k)
-    new_v = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-    _timed_call("v_proj", d, kv_proj_k, new_kv_in, w[f"vw.{li}"], new_v)
+    _timed_call("q_proj", d, q_proj_k, s["normed"], w[f"qw.{li}"], s["q"])
+    new_kv_in = ttnn.concat([new_ctx, s["normed"]], dim=0)
+    _timed_call("k_proj", d, kv_proj_k, new_kv_in, w[f"kw.{li}"], s["new_k"])
+    _timed_call("v_proj", d, kv_proj_k, new_kv_in, w[f"vw.{li}"], s["new_v"])
 
     # QK-norm
-    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
-    new_k_flat = ttnn.reshape(new_k, (new_kv_sp * NKVH, HDIM))
-    q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
-    _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
-    new_k_normed_flat = to_dev(torch.zeros(new_kv_sp * NKVH, HDIM), d)
-    _timed_call("qk_rmsnorm", d, head_norm_k, new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
-    q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
-    new_k_normed = ttnn.reshape(new_k_normed_flat, (new_kv_sp, NKVH * HDIM))
+    q_flat = ttnn.reshape(s["q"], (SP * NQH, HDIM))
+    new_k_flat = ttnn.reshape(s["new_k"], (new_kv_sp * NKVH, HDIM))
+    _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], s["q_normed_flat"])
+    _timed_call("qk_rmsnorm", d, head_norm_k, new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], s["new_k_normed_flat"])
+    q_normed = ttnn.reshape(s["q_normed_flat"], (SP, NQH * HDIM))
+    new_k_normed = ttnn.reshape(s["new_k_normed_flat"], (new_kv_sp, NKVH * HDIM))
 
-    # RoPE on Q and new K only
-    if scratch is not None:
-        q_roped = scratch["q_roped"]
-        new_k_roped = scratch["new_k_roped"]
-    else:
-        q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
-        new_k_roped = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-    _timed_call("q_rope", d, q_rope_k, q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
-    _timed_call("k_rope", d, k_rope_k, new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], new_k_roped)
+    # RoPE
+    _timed_call("q_rope", d, q_rope_k, q_normed, w["rope_cos_q"], w["rope_sin_q"], s["q_roped"])
+    _timed_call("k_rope", d, k_rope_k, new_k_normed, w["rope_cos_new_kv"], w["rope_sin_new_kv"], s["new_k_roped"])
 
     # Reshape new K/V to 4D for cache concat and SDPA
-    new_k_4d = ttnn.transpose(ttnn.reshape(new_k_roped, (1, new_kv_sp, NKVH, HDIM)), 1, 2)
-    new_v_4d = ttnn.transpose(ttnn.reshape(new_v, (1, new_kv_sp, NKVH, HDIM)), 1, 2)
+    new_k_4d = ttnn.transpose(ttnn.reshape(s["new_k_roped"], (1, new_kv_sp, NKVH, HDIM)), 1, 2)
+    new_v_4d = ttnn.transpose(ttnn.reshape(s["new_v"], (1, new_kv_sp, NKVH, HDIM)), 1, 2)
 
     # Build full K/V in 4D: cached + new (concat along seq dim)
     if layer_cache is not None:
@@ -451,29 +437,23 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
         v4 = new_v_4d
 
     # SDPA
-    q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
+    q4 = ttnn.transpose(ttnn.reshape(s["q_roped"], (1, SP, NQH, HDIM)), 1, 2)
     attn_mask = w.get("attn_mask")
     attn = ttnn.transformer.scaled_dot_product_attention(
         q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
     # Fused o_proj matmul + residual add
-    h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
-    h = h_new
+    _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, s["h_new"])
 
     # Post-attention RMSNorm
-    normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
+    _timed_call("pa_rmsnorm", d, norm_k, s["h_new"], w[f"pa_w_tt.{li}"], w["sc"], w["ms"], s["normed2"])
 
     # Fused gate/up matmul + silu_mul
-    act = to_dev(torch.zeros(SP, DINTER), d)
-    _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
+    _timed_call("gate_up+silu", d, gate_up_silu_k, s["normed2"], w[f"gw.{li}"], w[f"uw.{li}"], s["act"])
 
     # Fused down_proj matmul + residual add
-    h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
-    h = h_new2
+    _timed_call("down+resadd", d, down_proj_resadd_k, s["act"], w[f"fc2.{li}"], s["h_new"], s["h_new2"])
 
     # Cache K/V
     if CACHE_NOISE:
@@ -486,27 +466,109 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
             "v": ttnn.slice(v4, [0, 0, 0, 0], [1, NKVH, ctx_end, HDIM]),
         }
 
-    return h, updated
+    return s["h_new2"], updated
+
+
+# ---------------------------------------------------------------------------
+# DFlash class: init + step with pre-allocated scratch
+# ---------------------------------------------------------------------------
+class DFlashDraft:
+    """DFlash draft model with pre-allocated scratch buffers.
+
+    Usage:
+        draft = DFlashDraft(device)
+        draft.alloc_scratch(new_kv_sp)
+        ctx = draft.prepare_context(target_hidden)
+        draft.setup_rope_cached(cache_rows, new_ctx_sp, ...)
+        out, cache = draft.step(noise, new_ctx, cache)
+    """
+
+    def __init__(self, d):
+        self.d = d
+        self.w = load_draft_weights(d)
+        self._scratch = None
+
+    def alloc_scratch(self, new_kv_sp):
+        """Pre-allocate output buffers for cached forward. Call once before decode."""
+        d = self.d
+        z = lambda *shape: to_dev(torch.zeros(*shape), d)
+        self._scratch = {
+            # Fixed size (SP-based), reused every layer
+            "normed": z(SP, HIDDEN),
+            "q": z(SP, NQH * HDIM),
+            "q_normed_flat": z(SP * NQH, HDIM),
+            "q_roped": z(SP, NQH * HDIM),
+            "h_new": z(SP, HIDDEN),
+            "normed2": z(SP, HIDDEN),
+            "act": z(SP, DINTER),
+            "h_new2": z(SP, HIDDEN),
+            "fn_out": z(SP, HIDDEN),
+            # Variable size (new_kv_sp-based)
+            "new_k": z(new_kv_sp, NKVH * HDIM),
+            "new_v": z(new_kv_sp, NKVH * HDIM),
+            "new_k_normed_flat": z(new_kv_sp * NKVH, HDIM),
+            "new_k_roped": z(new_kv_sp, NKVH * HDIM),
+        }
+
+    def prepare_context(self, target_hidden):
+        """FC projection + hidden norm on target hidden states."""
+        return prepare_context_ttnn(target_hidden, self.w, self.d)
+
+    def setup_rope(self, cache_rows, new_ctx_sp, q_start=None, new_ctx_real=None):
+        """Upload RoPE tables for cached forward."""
+        setup_rope_tables_cached(self.w, cache_rows, new_ctx_sp, self.d,
+                                 q_start=q_start, new_ctx_real=new_ctx_real)
+
+    def step(self, noise, new_ctx, cache):
+        """One cached forward pass through 8 layers + final norm.
+
+        Returns: (output, updated_cache)
+        """
+        s = self._scratch
+        w, d = self.w, self.d
+        h = noise
+        new_cache = []
+        for li in range(DLAYERS):
+            lc = cache[li] if cache is not None else None
+            h, updated_lc = _layer_fwd_cached(h, new_ctx, w, li, d, lc, s)
+            new_cache.append(updated_lc)
+        _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], s["fn_out"])
+        return s["fn_out"], new_cache
 
 
 def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
-    """8-layer draft forward with KV cache.
+    """Backward-compat wrapper: 8-layer cached forward without class.
 
-    noise: (SP, HIDDEN) noise embedding on device
-    new_ctx: (new_ctx_sp, HIDDEN) new context rows, already projected+normed
-    cache: list of 8 layer caches, or None for first call
-    scratch: pre-allocated tensors from prealloc_cached_scratch, or None
-    Returns: (output, updated_cache)
+    Allocates output buffers inline. For production use DFlashDraft.step()
+    which uses pre-allocated scratch.
     """
+    new_kv_sp = w["new_kv_sp"]
+    if scratch is None:
+        scratch = {}
+    z = lambda *shape: to_dev(torch.zeros(*shape), d)
+    s = {
+        "normed": z(SP, HIDDEN),
+        "q": z(SP, NQH * HDIM),
+        "q_normed_flat": z(SP * NQH, HDIM),
+        "q_roped": scratch.get("q_roped", z(SP, NQH * HDIM)),
+        "h_new": z(SP, HIDDEN),
+        "normed2": z(SP, HIDDEN),
+        "act": z(SP, DINTER),
+        "h_new2": z(SP, HIDDEN),
+        "new_k": z(new_kv_sp, NKVH * HDIM),
+        "new_v": z(new_kv_sp, NKVH * HDIM),
+        "new_k_normed_flat": z(new_kv_sp * NKVH, HDIM),
+        "new_k_roped": scratch.get("new_k_roped", z(new_kv_sp, NKVH * HDIM)),
+        "fn_out": z(SP, HIDDEN),
+    }
     h = noise
     new_cache = []
     for li in range(DLAYERS):
         lc = cache[li] if cache is not None else None
-        h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc, scratch)
+        h, updated_lc = _layer_fwd_cached(h, new_ctx, w, li, d, lc, s)
         new_cache.append(updated_lc)
-    out = to_dev(torch.zeros(SP, HIDDEN), d)
-    _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
-    return out, new_cache
+    _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], s["fn_out"])
+    return s["fn_out"], new_cache
 
 
 def crop_cache(cache, keep_rows):
