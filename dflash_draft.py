@@ -1,7 +1,7 @@
-"""DFlash draft model: 8-layer cross-attention on single Tenstorrent device.
+"""DFlash draft model: 8-layer cross-attention on Tenstorrent device.
 
-Stacked Q heads + TTNN matmul + TT-Lang softmax for GQA attention.
-All ops on device, zero host readbacks in the forward pass.
+All compute runs via TT-Lang fused kernels. TTNN used only for SDPA,
+reshape/transpose (SDPA interface), and KV cache management.
 """
 import time
 import torch
@@ -36,13 +36,8 @@ SP = ((BSIZE + TILE - 1) // TILE) * TILE
 N_CTX_LAYERS = 5
 TLAYER_IDS = [1, 12, 23, 34, 45]
 MASK_ID = 151669
-DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
+DRAFT_DIR = "/home/zcarver/dflash"
 
-# When True, use TT-Lang kernels for softmax, residual_add, silu_mul.
-# RoPE is always TT-Lang regardless of this flag.
-TTLANG_ENABLED = False
-# TT-Lang rmsnorm produces ~0.63x magnitude on 4-chip mesh (reduction bug).
-TTLANG_RMSNORM = False
 # When True, cache noise K/V (matching reference DynamicCache behavior).
 # When False, only cache context K/V (may improve acceptance at bf16).
 CACHE_NOISE = True
@@ -248,152 +243,42 @@ def setup_rope_tables(w, ctx_sp, d, q_start=None, ctx_real=None):
 
 
 # ---------------------------------------------------------------------------
-# Forward pass
-# ---------------------------------------------------------------------------
-def draft_layer_fwd(h, ctx_dev, w, li, d):
-    """Single layer forward on device."""
-    scale = 1.0 / (HDIM ** 0.5)
-    kv_sp = w["kv_sp"]
-
-    normed = to_dev(torch.zeros(SP, HIDDEN), d)
-    norm_k(h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
-
-    q = ttnn.matmul(normed, w[f"qw.{li}"])
-    kv_in = ttnn.concat([ctx_dev, normed], dim=0)
-    k = ttnn.matmul(kv_in, w[f"kw.{li}"])
-    v = ttnn.matmul(kv_in, w[f"vw.{li}"])
-
-    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
-    k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
-    q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
-    k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
-    q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
-    k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
-
-    q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
-    k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
-    q_rope_k(q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
-    k_rope_k(k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
-
-    # Stacked Q + batched matmul + TT-Lang softmax for GQA
-    q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
-    k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
-    v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
-    q_grouped = ttnn.reshape(q4, (1, NKVH, GQA * SP, HDIM))
-    k_t = ttnn.transpose(k4, -2, -1)
-    scores = ttnn.matmul(q_grouped, k_t)
-    scores = ttnn.multiply(scores, scale)
-
-    total_q_rows = NKVH * GQA * SP
-    scores_flat = ttnn.reshape(scores, (total_q_rows, kv_sp))
-    probs_flat = to_dev(torch.zeros(total_q_rows, kv_sp), d)
-    w["softmax_k"](scores_flat, w["sc"], probs_flat)
-
-    probs_4d = ttnn.reshape(probs_flat, (1, NKVH, GQA * SP, kv_sp))
-    attn_4d = ttnn.matmul(probs_4d, v4)
-    attn_heads = ttnn.reshape(attn_4d, (1, NQH, SP, HDIM))
-    attn_flat = ttnn.reshape(ttnn.transpose(attn_heads, 1, 2), (SP, NQH * HDIM))
-
-    o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-
-    add_out = to_dev(torch.zeros(SP, HIDDEN), d)
-    residual_add_kernel(h, o, add_out)
-    h = add_out
-
-    normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-    norm_k(h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
-
-    gate = ttnn.matmul(normed2, w[f"gw.{li}"])
-    up = ttnn.matmul(normed2, w[f"uw.{li}"])
-    act = ttnn.zeros_like(gate)
-    silu_mul_kernel(gate, up, act)
-    down = ttnn.matmul(act, w[f"fc2.{li}"])
-
-    add_out2 = to_dev(torch.zeros(SP, HIDDEN), d)
-    residual_add_kernel(h, down, add_out2)
-    return add_out2
-
-
-def draft_fwd(noise, ctx, w, d):
-    """Full 8-layer draft forward. Returns (SP, HIDDEN) after final norm."""
-    h = noise
-    for li in range(DLAYERS):
-        h = draft_layer_fwd(h, ctx, w, li, d)
-    out = to_dev(torch.zeros(SP, HIDDEN), d)
-    norm_k(h, w["fn_w_tt"], w["sc"], w["ms"], out)
-    return out
-
-
-def prepare_context(target_hidden, w, d):
-    """FC projection + hidden norm on target hidden states.
-
-    Args:
-        target_hidden: (ctx_sp, N_CTX_LAYERS * HIDDEN) on device
-        w: weight dict
-        d: device
-
-    Returns:
-        (ctx_sp, HIDDEN) on device
-    """
-    ctx_proj = ttnn.matmul(target_hidden, w["fc_w"])
-    ctx_sp = ctx_proj.shape[0]
-    ctx_norm = to_dev(torch.zeros(ctx_sp, HIDDEN), d)
-    norm_k(ctx_proj, w["hn_w_tt"], w["sc"], w["ms"], ctx_norm)
-    return ctx_norm
-
-
-# ---------------------------------------------------------------------------
-# TTNN-only forward (for mesh devices where TT-Lang has scaling issues)
+# Non-cached forward
 # ---------------------------------------------------------------------------
 def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
-    """Single layer forward. Uses TT-Lang kernels when TTLANG_ENABLED."""
+    """Single layer forward using TT-Lang kernels."""
     kv_sp = w["kv_sp"]
 
     # Input RMSNorm
-    if TTLANG_ENABLED:
-        normed = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
-    else:
-        normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
+    normed = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
 
     # Q/K/V projections
-    if TTLANG_ENABLED:
-        q = to_dev(torch.zeros(SP, NQH * HDIM), d)
-        _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
-        kv_in = ttnn.concat([ctx_dev, normed], dim=0)
-        k = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
-        _timed_call("k_proj", d, kv_proj_k, kv_in, w[f"kw.{li}"], k)
-        v = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
-        _timed_call("v_proj", d, kv_proj_k, kv_in, w[f"vw.{li}"], v)
-    else:
-        q = ttnn.matmul(normed, w[f"qw.{li}"])
-        kv_in = ttnn.concat([ctx_dev, normed], dim=0)
-        k = ttnn.matmul(kv_in, w[f"kw.{li}"])
-        v = ttnn.matmul(kv_in, w[f"vw.{li}"])
-
-    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
-    k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
+    q = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
+    kv_in = ttnn.concat([ctx_dev, normed], dim=0)
+    k = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+    _timed_call("k_proj", d, kv_proj_k, kv_in, w[f"kw.{li}"], k)
+    v = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
+    _timed_call("v_proj", d, kv_proj_k, kv_in, w[f"vw.{li}"], v)
 
     # QK-norm RMSNorm
-    if TTLANG_ENABLED:
-        q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
-        _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
-        k_normed_flat = to_dev(torch.zeros(kv_sp * NKVH, HDIM), d)
-        _timed_call("qk_rmsnorm", d, head_norm_k, k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], k_normed_flat)
-    else:
-        q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
-        k_normed_flat = ttnn.rms_norm(k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
-
+    q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
+    k_flat = ttnn.reshape(k, (kv_sp * NKVH, HDIM))
+    q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+    k_normed_flat = to_dev(torch.zeros(kv_sp * NKVH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], k_normed_flat)
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     k_normed = ttnn.reshape(k_normed_flat, (kv_sp, NKVH * HDIM))
 
-    # TT-Lang rope (always -- element-wise, works on mesh)
+    # RoPE
     q_roped = to_dev(torch.zeros(SP, NQH * HDIM), d)
     k_roped = to_dev(torch.zeros(kv_sp, NKVH * HDIM), d)
     _timed_call("q_rope", d, q_rope_k, q_normed, w["rope_cos_q"], w["rope_sin_q"], q_roped)
     _timed_call("k_rope", d, k_rope_k, k_normed, w["rope_cos_kv"], w["rope_sin_kv"], k_roped)
 
-    # SDPA: fused Q×K^T + scale + softmax + probs×V
+    # SDPA
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
     k4 = ttnn.transpose(ttnn.reshape(k_roped, (1, kv_sp, NKVH, HDIM)), 1, 2)
     v4 = ttnn.transpose(ttnn.reshape(v, (1, kv_sp, NKVH, HDIM)), 1, 2)
@@ -402,39 +287,23 @@ def draft_layer_fwd_ttnn(h, ctx_dev, w, li, d):
         q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
-    # Fused o_proj matmul + residual add: h = (attn_flat @ ow) + h
-    if TTLANG_ENABLED:
-        h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
-        h = h_new
-    else:
-        o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-        h = ttnn.add(h, o)
+    # Fused o_proj matmul + residual add
+    h_new = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
+    h = h_new
 
     # Post-attention RMSNorm
-    if TTLANG_ENABLED:
-        normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
-    else:
-        normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
+    normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
 
-    # Fused gate/up matmul + silu_mul: act = silu(normed2 @ gw) * (normed2 @ uw)
-    if TTLANG_ENABLED:
-        act = to_dev(torch.zeros(SP, DINTER), d)
-        _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
-    else:
-        gate = ttnn.matmul(normed2, w[f"gw.{li}"])
-        up = ttnn.matmul(normed2, w[f"uw.{li}"])
-        act = ttnn.mul(ttnn.silu(gate), up)
+    # Fused gate/up matmul + silu_mul
+    act = to_dev(torch.zeros(SP, DINTER), d)
+    _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
 
-    # Fused down_proj matmul + residual add: h = (act @ fc2) + h
-    if TTLANG_ENABLED:
-        h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
-        return h_new2
-    else:
-        down = ttnn.matmul(act, w[f"fc2.{li}"])
-        return ttnn.add(h, down)
+    # Fused down_proj matmul + residual add
+    h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
+    return h_new2
 
 
 def draft_fwd_ttnn(noise, ctx, w, d):
@@ -442,17 +311,13 @@ def draft_fwd_ttnn(noise, ctx, w, d):
     h = noise
     for li in range(DLAYERS):
         h = draft_layer_fwd_ttnn(h, ctx, w, li, d)
-    # Final RMSNorm
-    if TTLANG_ENABLED:
-        out = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
-        return out
-    else:
-        return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS)
+    out = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
+    return out
 
 
 def prepare_context_ttnn(target_hidden, w, d):
-    """FC projection + hidden norm using TTNN ops only.
+    """FC projection + hidden norm.
 
     Splits the 10240->2048 FC into 5 x 2048->2048 matmuls to reduce
     bf16 accumulation error (inner dim 2048 vs 10240).
@@ -466,13 +331,9 @@ def prepare_context_ttnn(target_hidden, w, d):
     ctx_proj = parts[0]
     for p in parts[1:]:
         ctx_proj = ttnn.add(ctx_proj, p)
-    # Context RMSNorm: TT-Lang or TTNN
-    if TTLANG_RMSNORM:  # ~0.63x magnitude on mesh -- disabled until fixed
-        ctx_norm = to_dev(torch.zeros(ctx_sp, HIDDEN), d)
-        norm_k(ctx_proj, w["hn_w_tt"], w["sc"], w["ms"], ctx_norm)
-        return ctx_norm
-    else:
-        return ttnn.rms_norm(ctx_proj, weight=w["hn_w"], epsilon=EPS)
+    ctx_norm = to_dev(torch.zeros(ctx_sp, HIDDEN), d)
+    norm_k(ctx_proj, w["hn_w_tt"], w["sc"], w["ms"], ctx_norm)
+    return ctx_norm
 
 
 # ---------------------------------------------------------------------------
@@ -542,43 +403,28 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
     new_ctx_sp = new_ctx.shape[0]
     new_kv_sp = w["new_kv_sp"]
     total_kv = w["total_kv"]
-    cache_len = w["total_kv"] - new_kv_sp  # = cache_len passed to setup
+    cache_len = w["total_kv"] - new_kv_sp
 
     # Input RMSNorm
-    if TTLANG_ENABLED:
-        normed = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
-    else:
-        normed = ttnn.rms_norm(h, weight=w[f"in_w.{li}"], epsilon=EPS)
+    normed = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("in_rmsnorm", d, norm_k, h, w[f"in_w_tt.{li}"], w["sc"], w["ms"], normed)
 
     # Q from noise only, K/V from new context + noise
-    if TTLANG_ENABLED:
-        q = to_dev(torch.zeros(SP, NQH * HDIM), d)
-        _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
-        new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
-        new_k = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-        _timed_call("k_proj", d, kv_proj_k, new_kv_in, w[f"kw.{li}"], new_k)
-        new_v = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
-        _timed_call("v_proj", d, kv_proj_k, new_kv_in, w[f"vw.{li}"], new_v)
-    else:
-        q = ttnn.matmul(normed, w[f"qw.{li}"])
-        new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
-        new_k = ttnn.matmul(new_kv_in, w[f"kw.{li}"])
-        new_v = ttnn.matmul(new_kv_in, w[f"vw.{li}"])
+    q = to_dev(torch.zeros(SP, NQH * HDIM), d)
+    _timed_call("q_proj", d, q_proj_k, normed, w[f"qw.{li}"], q)
+    new_kv_in = ttnn.concat([new_ctx, normed], dim=0)
+    new_k = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
+    _timed_call("k_proj", d, kv_proj_k, new_kv_in, w[f"kw.{li}"], new_k)
+    new_v = to_dev(torch.zeros(new_kv_sp, NKVH * HDIM), d)
+    _timed_call("v_proj", d, kv_proj_k, new_kv_in, w[f"vw.{li}"], new_v)
 
     # QK-norm
     q_flat = ttnn.reshape(q, (SP * NQH, HDIM))
     new_k_flat = ttnn.reshape(new_k, (new_kv_sp * NKVH, HDIM))
-
-    if TTLANG_ENABLED:
-        q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
-        _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
-        new_k_normed_flat = to_dev(torch.zeros(new_kv_sp * NKVH, HDIM), d)
-        _timed_call("qk_rmsnorm", d, head_norm_k, new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
-    else:
-        q_normed_flat = ttnn.rms_norm(q_flat, weight=w[f"qnw.{li}"], epsilon=EPS)
-        new_k_normed_flat = ttnn.rms_norm(new_k_flat, weight=w[f"knw.{li}"], epsilon=EPS)
-
+    q_normed_flat = to_dev(torch.zeros(SP * NQH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, q_flat, w[f"qnw_tt.{li}"], w["sc"], w["ms_head"], q_normed_flat)
+    new_k_normed_flat = to_dev(torch.zeros(new_kv_sp * NKVH, HDIM), d)
+    _timed_call("qk_rmsnorm", d, head_norm_k, new_k_flat, w[f"knw_tt.{li}"], w["sc"], w["ms_head"], new_k_normed_flat)
     q_normed = ttnn.reshape(q_normed_flat, (SP, NQH * HDIM))
     new_k_normed = ttnn.reshape(new_k_normed_flat, (new_kv_sp, NKVH * HDIM))
 
@@ -604,52 +450,35 @@ def draft_layer_fwd_cached(h, new_ctx, w, li, d, layer_cache, scratch=None):
         k4 = new_k_4d
         v4 = new_v_4d
 
-    # SDPA: fused Q×K^T + scale + softmax + probs×V
+    # SDPA
     q4 = ttnn.transpose(ttnn.reshape(q_roped, (1, SP, NQH, HDIM)), 1, 2)
     attn_mask = w.get("attn_mask")
     attn = ttnn.transformer.scaled_dot_product_attention(
         q4, k4, v4, is_causal=False, attn_mask=attn_mask)
     attn_flat = ttnn.reshape(ttnn.transpose(attn, 1, 2), (SP, NQH * HDIM))
 
-    # Fused o_proj matmul + residual add: h = (attn_flat @ ow) + h
-    if TTLANG_ENABLED:
-        h_new = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
-        h = h_new
-    else:
-        o = ttnn.matmul(attn_flat, w[f"ow.{li}"])
-        h = ttnn.add(h, o)
+    # Fused o_proj matmul + residual add
+    h_new = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("o_proj+resadd", d, o_proj_resadd_k, attn_flat, w[f"ow.{li}"], h, h_new)
+    h = h_new
 
     # Post-attention RMSNorm
-    if TTLANG_ENABLED:
-        normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
-    else:
-        normed2 = ttnn.rms_norm(h, weight=w[f"pa_w.{li}"], epsilon=EPS)
+    normed2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("pa_rmsnorm", d, norm_k, h, w[f"pa_w_tt.{li}"], w["sc"], w["ms"], normed2)
 
-    # Fused gate/up matmul + silu_mul: act = silu(normed2 @ gw) * (normed2 @ uw)
-    if TTLANG_ENABLED:
-        act = to_dev(torch.zeros(SP, DINTER), d)
-        _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
-    else:
-        gate = ttnn.matmul(normed2, w[f"gw.{li}"])
-        up = ttnn.matmul(normed2, w[f"uw.{li}"])
-        act = ttnn.mul(ttnn.silu(gate), up)
+    # Fused gate/up matmul + silu_mul
+    act = to_dev(torch.zeros(SP, DINTER), d)
+    _timed_call("gate_up+silu", d, gate_up_silu_k, normed2, w[f"gw.{li}"], w[f"uw.{li}"], act)
 
-    # Fused down_proj matmul + residual add: h = (act @ fc2) + h
-    if TTLANG_ENABLED:
-        h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
-        h = h_new2
-    else:
-        down = ttnn.matmul(act, w[f"fc2.{li}"])
-        h = ttnn.add(h, down)
+    # Fused down_proj matmul + residual add
+    h_new2 = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("down+resadd", d, down_proj_resadd_k, act, w[f"fc2.{li}"], h, h_new2)
+    h = h_new2
 
-    # Cache K/V; reference model only caches context (not noise)
+    # Cache K/V
     if CACHE_NOISE:
         updated = {"k": k4, "v": v4}
     else:
-        # Context-only: keep exact real context rows, exclude noise and padding
         new_ctx_real_count = w.get("new_ctx_real", new_ctx.shape[0])
         ctx_end = cache_len + new_ctx_real_count
         updated = {
@@ -675,13 +504,9 @@ def draft_fwd_cached(noise, new_ctx, w, d, cache, scratch=None):
         lc = cache[li] if cache is not None else None
         h, updated_lc = draft_layer_fwd_cached(h, new_ctx, w, li, d, lc, scratch)
         new_cache.append(updated_lc)
-    # Final RMSNorm
-    if TTLANG_ENABLED:
-        out = to_dev(torch.zeros(SP, HIDDEN), d)
-        _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
-        return out, new_cache
-    else:
-        return ttnn.rms_norm(h, weight=w["fn_w"], epsilon=EPS), new_cache
+    out = to_dev(torch.zeros(SP, HIDDEN), d)
+    _timed_call("fn_rmsnorm", d, norm_k, h, w["fn_w_tt"], w["sc"], w["ms"], out)
+    return out, new_cache
 
 
 def crop_cache(cache, keep_rows):

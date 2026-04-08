@@ -29,13 +29,8 @@ from dflash_draft import (
     _tile_pad,
 )
 
-TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
+TARGET_DIR = "/home/zcarver/qwen-coder-30b-a3b"
 
-# Set True to use TT-Lang kernels for softmax, residual_add, silu_mul
-USE_TTLANG = True
-dflash_draft.TTLANG_ENABLED = USE_TTLANG
-# TT-Lang rmsnorm has ~0.63x magnitude bug on mesh -- enable to test the flow
-dflash_draft.TTLANG_RMSNORM = False
 # Match reference model: only cache context K/V, not noise
 dflash_draft.CACHE_NOISE = False
 

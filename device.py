@@ -30,7 +30,7 @@ NKVH_TP = NKVH // N_CHIPS  # 1 KV head per chip
 Q_TP = NQH_TP * HDIM       # 1024
 KV_TP = NKVH_TP * HDIM     # 128
 
-TARGET_DIR = "/workspace/qwen-coder-30b-a3b/weights"
+TARGET_DIR = "/home/zcarver/qwen-coder-30b-a3b"
 
 # Kernel instances
 rmsnorm_k = make_rmsnorm_kernel(dim_tiles=HTILES, eps=EPS)

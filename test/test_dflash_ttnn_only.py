@@ -24,8 +24,7 @@ from dflash_draft import (o_proj_resadd_k, down_proj_resadd_k, gate_up_silu_k,
                           norm_k, head_norm_k, q_proj_k, kv_proj_k,
                           DINTER, HDIM_TILES)
 
-# Enable TT-Lang kernels in dflash_draft cached forward
-dflash_draft.TTLANG_ENABLED = True
+# TT-Lang is now the only path
 
 TILE = 32
 HIDDEN = 2048
@@ -43,7 +42,7 @@ DINTER = 6144
 BSIZE = 16
 SP = ((BSIZE + TILE - 1) // TILE) * TILE
 N_CTX_LAYERS = 5
-DRAFT_DIR = "/workspace/qwen-coder-30b-a3b/dflash"
+DRAFT_DIR = "/home/zcarver/dflash"
 
 
 def _tile_pad(n):
