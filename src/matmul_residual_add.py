@@ -59,16 +59,13 @@ def make_matmul_residual_add_kernel(k_tiles):
             for local_t in range(units_per_core):
                 t = core_x * units_per_core + local_t
                 if t < total:
-                    m = t // col_groups
                     g = t % col_groups
                     sc = g * NCOLS
                     for k in range(k_tiles):
-                        with a_dfb.reserve() as blk:
-                            tx = ttl.copy(a[m, k], blk); tx.wait()
                         with w_dfb.reserve() as blk:
                             tx = ttl.copy(w[k, sc:sc + NCOLS], blk); tx.wait()
                     with res_dfb.reserve() as blk:
-                        tx = ttl.copy(residual[m, sc:sc + NCOLS], blk); tx.wait()
+                        tx = ttl.copy(residual[t // col_groups, sc:sc + NCOLS], blk); tx.wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -77,9 +74,10 @@ def make_matmul_residual_add_kernel(k_tiles):
                 t = core_x * units_per_core + local_t
                 if t < total:
                     m = t // col_groups
-                    g = t % col_groups
-                    sc = g * NCOLS
+                    for k in range(k_tiles):
+                        with a_dfb.reserve() as blk:
+                            tx = ttl.copy(a[m, k], blk); tx.wait()
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[m, sc:sc + NCOLS]); tx.wait()
+                        tx = ttl.copy(blk, out[m, (t % col_groups) * NCOLS:(t % col_groups) * NCOLS + NCOLS]); tx.wait()
 
     return matmul_residual_add

@@ -26,16 +26,19 @@ def to_dev(t, d):
                            device=d, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 def test_silu_mul_weight(d):
-    from silu_mul_weight import silu_mul_weight_kernel
-    gate = torch.randn(32, 256, dtype=torch.bfloat16)
-    up = torch.randn(32, 256, dtype=torch.bfloat16)
-    w = torch.randn(32, 256, dtype=torch.bfloat16) * 0.1 + 1.0
+    from silu_mul_weight import make_silu_mul_weight_kernel
+    # 8x8 block = 256x256 elements, use tensor that divides evenly
+    R, C = 256, 256
+    gate = torch.randn(R, C, dtype=torch.bfloat16)
+    up = torch.randn(R, C, dtype=torch.bfloat16)
+    w = torch.randn(R, C, dtype=torch.bfloat16) * 0.1 + 1.0
     expected = F.silu(gate.float()) * up.float() * w.float()
     out_dev = to_dev(torch.zeros_like(gate), d)
-    silu_mul_weight_kernel(to_dev(gate, d), to_dev(up, d), to_dev(w, d), out_dev)
-    result = ttnn.to_torch(out_dev)[:32, :256]
+    kernel = make_silu_mul_weight_kernel(block_r=8, block_c=8, buf=3)
+    kernel(to_dev(gate, d), to_dev(up, d), to_dev(w, d), out_dev)
+    result = ttnn.to_torch(out_dev)[:R, :C]
     p = pcc(expected, result)
-    print(f"silu_mul_weight: PCC={p:.6f} {'PASS' if p > 0.99 else 'FAIL'}")
+    print(f"silu_mul_weight (8x8 block): PCC={p:.6f} {'PASS' if p > 0.99 else 'FAIL'}")
     assert p > 0.99, f"silu_mul_weight PCC too low: {p}"
 
 def test_rope(d):
